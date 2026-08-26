@@ -1,0 +1,4 @@
+interface:
+  display_name: "termgun Development"
+  short_description: "termgun 코드 변경에 필요한 규칙과 검증 절차"
+  default_prompt: "Use $termgun-development to make and verify a safe termgun code change."
