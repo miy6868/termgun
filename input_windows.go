@@ -13,16 +13,24 @@ package main
 
 import (
 	"os"
-	"time"
 	"unsafe"
 )
 
-var procReadConsoleInput = kernel32.NewProc("ReadConsoleInputW")
+var (
+	procReadConsoleInput    = kernel32.NewProc("ReadConsoleInputW")
+	procWaitForSingleObject = kernel32.NewProc("WaitForSingleObject")
+)
+
+const (
+	waitObject0      = 0
+	waitFailed       = ^uintptr(0)
+	waitResizePollMS = 250
+)
 
 // readEvents pumps console records onto ch. leftover is unused: nothing was
 // read ahead of this point, because there is no capability handshake to run.
 func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
-	h := uintptr(fd)
+	handle := uintptr(fd)
 
 	go func() {
 		defer close(ch)
@@ -37,10 +45,30 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 			originX, originY = int(info.Window.Left), int(info.Window.Top)
 		}
 
+		w, h := terminalSize(fd)
 		for {
+			// Waiting with a timeout keeps input and resize polling in one
+			// producer. A separate polling goroutine could send after this one
+			// closes ch when the console handle fails.
+			ready, _, _ := procWaitForSingleObject.Call(handle, waitResizePollMS)
+			if ready == waitFailed {
+				return
+			}
+			nw, nh := terminalSize(fd)
+			if nw != w || nh != h {
+				w, h = nw, nh
+				if info, ok := screenBufferInfo(); ok {
+					originX, originY = int(info.Window.Left), int(info.Window.Top)
+				}
+				ch <- Event{Kind: EvResize, W: w, H: h}
+			}
+			if ready != waitObject0 {
+				continue
+			}
+
 			var read uint32
 			r, _, _ := procReadConsoleInput.Call(
-				h,
+				handle,
 				uintptr(unsafe.Pointer(&recs[0])),
 				uintptr(len(recs)),
 				uintptr(unsafe.Pointer(&read)),
@@ -75,24 +103,9 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 					if info, ok := screenBufferInfo(); ok {
 						originX, originY = int(info.Window.Left), int(info.Window.Top)
 					}
-					w, h := terminalSize(fd)
+					w, h = terminalSize(fd)
 					ch <- Event{Kind: EvResize, W: w, H: h}
 				}
-			}
-		}
-	}()
-
-	// A resize record covers the screen *buffer* changing size. Dragging the
-	// window edge does not always change the buffer, so the size is polled as
-	// well; a comparison four times a second costs nothing and is the
-	// difference between a stretched window redrawing and not.
-	go func() {
-		w, h := terminalSize(fd)
-		for range time.Tick(250 * time.Millisecond) {
-			nw, nh := terminalSize(fd)
-			if nw != w || nh != h {
-				w, h = nw, nh
-				ch <- Event{Kind: EvResize, W: w, H: h}
 			}
 		}
 	}()

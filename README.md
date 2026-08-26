@@ -4,15 +4,23 @@
 마우스로 조준·사격하며 다층 던전을 내려갑니다. Go 표준 라이브러리만 사용합니다.
 
 ```sh
+# Linux
 go run .
 go build -o termgun .
 ./termgun -seed 42  # 같은 던전 재현
 ./termgun -fps 30   # 느린 터미널
-./termgun -zoom 3  # 배율 1~4, 기본 2
+./termgun -zoom 3   # 배율 1~4, 기본 2
+
+# Windows (PowerShell)
+go build -o termgun.exe .
+.\termgun.exe -seed 42
 ```
 
 최소 터미널 크기는 60x20이며 256색 지원이 필요합니다. 현재 문서와 개발 대상은
-Linux만입니다.
+Linux와 Windows 10 이상입니다. Windows에서는 UTF-8과 ANSI 색상을 지원하는
+[Windows Terminal](https://github.com/microsoft/terminal)을 권장합니다. PowerShell이나
+명령 프롬프트에서 직접 빌드하거나, Linux에서
+`GOOS=windows GOARCH=amd64 go build -o termgun.exe .`로 교차 빌드할 수 있습니다.
 
 ## 조작
 
@@ -30,7 +38,8 @@ Linux만입니다.
 | `Q` / `R` | 종료 / 사망 후 재시작 |
 
 입력은 `-input auto|kitty|device|compat`로 선택합니다. `auto`는 kitty 키보드
-프로토콜, `/dev/input`, 호환 모드 순으로 시도합니다.
+프로토콜, `/dev/input`, 호환 모드 순으로 시도합니다. 이 선택은 Linux에만 적용되며,
+Windows에서는 콘솔의 키 누름·해제 이벤트를 직접 사용해 대각선 이동을 지원합니다.
 
 설정에서는 상하키로 항목을 고르고 좌우키로 조정합니다. 자동 일시정지, 게임 오버
 시드 표시, 자동 무기 변경, 화면 흔들림과 화면 배율을 바꿀 수 있습니다. 네 가지 토글은

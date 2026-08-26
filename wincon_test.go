@@ -88,6 +88,19 @@ func TestWindowsMovementKeysSurviveShift(t *testing.T) {
 	}
 }
 
+// TestWindowsMovementReleaseWithoutCharacter covers console hosts that leave
+// UnicodeChar empty on key-up even though the virtual-key code is still set.
+func TestWindowsMovementReleaseWithoutCharacter(t *testing.T) {
+	held := winKeyState{'W': true}
+	ev, ok := decodeKey(ptr(keyRecord(false, 'W', 0, false)), held)
+	if !ok || ev.Rune != 'w' || ev.KeyAct != KeyRelease {
+		t.Fatalf("characterless W release decoded as %+v (ok=%v)", ev, ok)
+	}
+	if held['W'] {
+		t.Error("characterless W release left the key held")
+	}
+}
+
 // TestWindowsArrowsAndSpecials checks the keys that arrive with no character.
 func TestWindowsArrowsAndSpecials(t *testing.T) {
 	cases := []struct {

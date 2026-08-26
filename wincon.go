@@ -80,6 +80,11 @@ func decodeKey(r *winRecord, held winKeyState) (ev Event, ok bool) {
 	down := r.u32(0) != 0
 	vk := r.u16(6)
 	ch := rune(r.u16(10))
+	// Some console hosts omit UnicodeChar on key-up records. Movement releases
+	// must still carry their letter or WASD remains held until focus changes.
+	if !down && ch == 0 && vk >= 'A' && vk <= 'Z' {
+		ch = rune(vk)
+	}
 	ctrl := r.u32(12)&(winLeftCtrl|winRightCtrl) != 0
 
 	ev = Event{Kind: EvKey, Src: SrcTTY}
