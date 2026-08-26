@@ -40,6 +40,7 @@ var (
 	procGetConsoleMode             = kernel32.NewProc("GetConsoleMode")
 	procSetConsoleMode             = kernel32.NewProc("SetConsoleMode")
 	procGetConsoleScreenBufferInfo = kernel32.NewProc("GetConsoleScreenBufferInfo")
+	procGetConsoleCP               = kernel32.NewProc("GetConsoleCP")
 	procGetConsoleOutputCP         = kernel32.NewProc("GetConsoleOutputCP")
 	procSetConsoleOutputCP         = kernel32.NewProc("SetConsoleOutputCP")
 	procSetConsoleCP               = kernel32.NewProc("SetConsoleCP")
@@ -76,7 +77,7 @@ func setConsoleMode(h uintptr, mode uint32) bool {
 type termState struct {
 	inHandle, outHandle uintptr
 	inMode, outMode     uint32
-	outCP               uint32
+	inCP, outCP         uint32
 }
 
 // enterRaw puts the console into the shape the game needs and remembers enough
@@ -93,11 +94,13 @@ func enterRaw(fd int) (*termState, error) {
 	if !ok {
 		return nil, errors.New("콘솔 출력 핸들을 열 수 없습니다")
 	}
-	cp, _, _ := procGetConsoleOutputCP.Call()
+	inCP, _, _ := procGetConsoleCP.Call()
+	outCP, _, _ := procGetConsoleOutputCP.Call()
 
 	st := &termState{
 		inHandle: in, outHandle: out,
-		inMode: inMode, outMode: outMode, outCP: uint32(cp),
+		inMode: inMode, outMode: outMode,
+		inCP: uint32(inCP), outCP: uint32(outCP),
 	}
 
 	// Line editing and echo off; window, mouse and key records on. Quick-edit
@@ -131,7 +134,9 @@ func (s *termState) restore() {
 	setConsoleMode(s.outHandle, s.outMode)
 	if s.outCP != 0 {
 		procSetConsoleOutputCP.Call(uintptr(s.outCP))
-		procSetConsoleCP.Call(uintptr(s.outCP))
+	}
+	if s.inCP != 0 {
+		procSetConsoleCP.Call(uintptr(s.inCP))
 	}
 }
 
