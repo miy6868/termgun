@@ -13,6 +13,7 @@ package main
 
 import (
 	"os"
+	"time"
 	"unsafe"
 )
 
@@ -25,6 +26,7 @@ const (
 	waitObject0      = 0
 	waitFailed       = ^uintptr(0)
 	waitResizePollMS = 250
+	waitMouseFlushMS = 8
 )
 
 // readEvents pumps console records onto ch. leftover is unused: nothing was
@@ -37,6 +39,8 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 		held := winKeyState{}
 		var buttons uint32
 		recs := make([]winRecord, 64)
+		coalescer := winEventCoalescer{}
+		emit := func(ev Event) { ch <- ev }
 
 		// The window origin shifts the mouse coordinates, which the console
 		// reports against the screen buffer rather than the visible window.
@@ -47,10 +51,15 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 
 		w, h := terminalSize(fd)
 		for {
+			coalescer.flushDue(time.Now(), emit)
 			// Waiting with a timeout keeps input and resize polling in one
 			// producer. A separate polling goroutine could send after this one
 			// closes ch when the console handle fails.
-			ready, _, _ := procWaitForSingleObject.Call(handle, waitResizePollMS)
+			waitMS := uintptr(waitResizePollMS)
+			if coalescer.hasMouse {
+				waitMS = waitMouseFlushMS
+			}
+			ready, _, _ := procWaitForSingleObject.Call(handle, waitMS)
 			if ready == waitFailed {
 				return
 			}
@@ -60,7 +69,7 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 				if info, ok := screenBufferInfo(); ok {
 					originX, originY = int(info.Window.Left), int(info.Window.Top)
 				}
-				ch <- Event{Kind: EvResize, W: w, H: h}
+				coalescer.offer(Event{Kind: EvResize, W: w, H: h}, time.Now(), emit)
 			}
 			if ready != waitObject0 {
 				continue
@@ -81,14 +90,14 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 				switch rec.eventType {
 				case winKeyEvent:
 					if ev, ok := decodeKey(rec, held); ok {
-						ch <- ev
+						coalescer.offer(ev, time.Now(), emit)
 					}
 				case winMouseEvent:
 					var ev Event
 					var ok bool
 					ev, buttons, ok = decodeMouse(rec, buttons, originX, originY)
 					if ok {
-						ch <- ev
+						coalescer.offer(ev, time.Now(), emit)
 					}
 				case winFocusEvent:
 					focus := rec.u32(0) != 0
@@ -98,13 +107,13 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 						// typing in another window.
 						held = winKeyState{}
 					}
-					ch <- Event{Kind: EvFocus, Focus: focus}
+					coalescer.offer(Event{Kind: EvFocus, Focus: focus}, time.Now(), emit)
 				case winResizeEvent:
 					if info, ok := screenBufferInfo(); ok {
 						originX, originY = int(info.Window.Left), int(info.Window.Top)
 					}
 					w, h = terminalSize(fd)
-					ch <- Event{Kind: EvResize, W: w, H: h}
+					coalescer.offer(Event{Kind: EvResize, W: w, H: h}, time.Now(), emit)
 				}
 			}
 		}

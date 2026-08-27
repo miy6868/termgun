@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // The Windows console hands the game a packed C union and the field offsets are
 // the whole game: get one wrong and every key is mis-read, silently. These tests
@@ -181,6 +184,28 @@ func TestWindowsMouseTracksTheWindow(t *testing.T) {
 func TestWindowsWheelIsNotAClick(t *testing.T) {
 	if _, _, ok := decodeMouse(ptr(mouseRecord(5, 5, 0, 0x0004)), 0, 0, 0); ok {
 		t.Error("a wheel tick produced a mouse button event")
+	}
+}
+
+func TestWindowsMouseFloodDoesNotDelayKeys(t *testing.T) {
+	var got []Event
+	emit := func(ev Event) { got = append(got, ev) }
+	var c winEventCoalescer
+	start := time.Unix(1, 0)
+
+	for x := 0; x < 100; x++ {
+		c.offer(Event{Kind: EvMouse, Action: MouseMove, MX: x}, start, emit)
+	}
+	c.offer(Event{Kind: EvKey, Rune: 'w'}, start, emit)
+
+	if len(got) != 2 {
+		t.Fatalf("mouse flood emitted %d events, want one move and one key", len(got))
+	}
+	if got[0].Kind != EvMouse || got[0].MX != 99 {
+		t.Errorf("coalesced mouse event = %+v, want latest position", got[0])
+	}
+	if got[1].Kind != EvKey || got[1].Rune != 'w' {
+		t.Errorf("event after mouse flood = %+v, want key", got[1])
 	}
 }
 
