@@ -1,5 +1,7 @@
 package main
 
+import "time"
+
 // Decoding Windows console input records.
 //
 // This file has no build tag on purpose. The Windows console hands the game a
@@ -16,6 +18,47 @@ const (
 	winResizeEvent = 0x0004
 	winFocusEvent  = 0x0010
 )
+
+// PowerShell's console host can produce mouse-move records much faster than
+// the game renders. Keep only the newest position between short flushes so
+// those records cannot queue in front of keyboard input for several frames.
+const winMouseFlushInterval = time.Second / 120
+
+type winEventCoalescer struct {
+	pendingMouse Event
+	hasMouse     bool
+	lastFlush    time.Time
+}
+
+func (c *winEventCoalescer) offer(ev Event, now time.Time, emit func(Event)) {
+	if ev.Kind == EvMouse && ev.Action == MouseMove {
+		c.pendingMouse, c.hasMouse = ev, true
+		c.flushDue(now, emit)
+		return
+	}
+	c.flush(emit)
+	emit(ev)
+	c.lastFlush = now
+}
+
+func (c *winEventCoalescer) flushDue(now time.Time, emit func(Event)) {
+	if c.hasMouse && c.lastFlush.IsZero() {
+		c.lastFlush = now
+		return
+	}
+	if c.hasMouse && now.Sub(c.lastFlush) >= winMouseFlushInterval {
+		c.flush(emit)
+		c.lastFlush = now
+	}
+}
+
+func (c *winEventCoalescer) flush(emit func(Event)) {
+	if !c.hasMouse {
+		return
+	}
+	emit(c.pendingMouse)
+	c.hasMouse = false
+}
 
 // Mouse event flags and button bits.
 const (
