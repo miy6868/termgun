@@ -154,6 +154,10 @@ func (g *Game) updateCamera() {
 
 func (g *Game) drawLevel(s *Screen) {
 	ox, oy := int(math.Floor(g.camX)), int(math.Floor(g.camY))
+	cx, cy := g.camCell()
+	z := g.zoomEff
+	screenLeft := g.viewX + g.shakeX - cx
+	screenTop := g.viewY + g.shakeY - cy
 	// Overdraw the edges: the camera sits on fractional coordinates so the last
 	// tile is usually half off-screen, and a screen shake slides the whole
 	// playfield far enough to expose tiles that were just outside it.
@@ -170,6 +174,7 @@ func (g *Game) drawLevel(s *Screen) {
 			continue
 		}
 		row := wy * lv.W
+		y0 := screenTop + wy*z
 		for tx := maxInt(-mx, -ox); tx <= g.tilesW+mx; tx++ {
 			wx := ox + tx
 			if wx >= lv.W {
@@ -259,15 +264,18 @@ func (g *Game) drawLevel(s *Screen) {
 					fg = colFloorDim
 				}
 			}
-			x0, y0 := g.worldToScreen(Vec{float64(wx), float64(wy)})
+			// Terrain always starts on whole tiles. Reuse the frame's integer
+			// transform instead of rebuilding it for every visible tile; moving
+			// entities still use worldToScreen to preserve sub-tile precision.
+			x0 := screenLeft + wx*z
 			if !fill {
 				// Centre the glyph in its block.
-				g.put(s, x0+g.zoomEff/2, y0+g.zoomEff/2, r, fg)
+				g.put(s, x0+z/2, y0+z/2, r, fg)
 				continue
 			}
 			// One clipped rectangle rather than zoom² separate writes, each of
 			// which would re-run the same bounds tests.
-			g.putRect(s, x0, y0, g.zoomEff, g.zoomEff, r, fg)
+			g.putRect(s, x0, y0, z, z, r, fg)
 		}
 	}
 }
