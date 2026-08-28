@@ -10,7 +10,7 @@
 
 | 파일 | 역할 |
 |---|---|
-| `main.go` | raw 모드, 고정 프레임 루프, 터미널 복구 |
+| `main.go` / `app.go` | CLI 설정 / 고정 프레임 루프와 게임 수명주기 |
 | `game.go` | 시뮬레이션, 충돌, 피해, 아이템, 레벨업, 이벤트 |
 | `render.go` | 카메라, 월드, HUD, 미니맵, 오버레이 |
 | `dungeon.go` | BSP, FOV, flow field, 타일 |
@@ -18,6 +18,7 @@
 | `weapon.go` / `entity.go` | 무기와 엔티티 정의 |
 | `rooms.go` / `props.go` / `pressure.go` | 특수방, 지형, 층 압박 |
 | `move.go` / `math.go` / `zoom.go` | 이동 상태, 벡터, 배율 |
+| `platform.go` | 공통 플랫폼 세션과 터미널 복구 |
 | `term.go` / `input.go` | 화면 버퍼, VT 입력 파싱 |
 
 플랫폼별 파일은 [platform.md](platform.md)를 본다.

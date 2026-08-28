@@ -12,6 +12,10 @@ const (
 	EvMouse
 	EvResize
 	EvFocus
+	// EvStop reports that the platform's primary event source ended. Producers
+	// never close the shared channel because resize and device sources may still
+	// be publishing to it.
+	EvStop
 )
 
 // EventSource says where a key event came from. Device events carry true

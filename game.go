@@ -860,7 +860,7 @@ func (g *Game) moveWithCollision(pos *Vec, delta Vec, radius float64) {
 	ry := rx / aspect
 
 	// A single frame can ask for a move several tiles long: a dash, a charging
-	// Brute, or any frame that stalled up to the 0.1s cap in main.go. Resolving
+	// Brute, or any frame that stalled up to the application loop's 0.1s cap. Resolving
 	// that in one shot only ever tests the destination, so a body steps clean
 	// over anything in between — at dash speed a 0.1s frame is 5.1 tiles, which
 	// crosses a two-tile-thick wall and lands on the far side. Advance in

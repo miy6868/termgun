@@ -51,16 +51,17 @@ var evdevKeys = map[uint16]int{
 	keyUp: dirUp, keyLeft: dirLeft, keyDown: dirDown, keyRight: dirRight,
 }
 
-// inputEvent mirrors the kernel's struct input_event on 64-bit Linux.
-type inputEvent struct {
-	Sec   int64
-	Usec  int64
-	Type  uint16
-	Code  uint16
-	Value int32
-}
-
-const inputEventSize = 24
+// Linux input_event starts with a timeval, whose two fields follow the native
+// pointer width. The remaining type, code, and value fields always take eight
+// bytes. Deriving the offsets keeps the decoder correct on both 32-bit and
+// 64-bit Linux without mirroring the ABI in a Go struct with different padding.
+const (
+	inputEventTimevalSize = int(unsafe.Sizeof(uintptr(0))) * 2
+	inputEventTypeOffset  = inputEventTimevalSize
+	inputEventCodeOffset  = inputEventTypeOffset + 2
+	inputEventValueOffset = inputEventCodeOffset + 2
+	inputEventSize        = inputEventValueOffset + 4
+)
 
 // evdevSource streams movement key transitions from every attached keyboard.
 type evdevSource struct {
@@ -118,7 +119,10 @@ func isKeyboard(fd int) bool {
 	const keyMax = 0x2ff
 	bits := make([]byte, keyMax/8+1)
 	// EVIOCGBIT(EV_KEY, len): _IOC(_IOC_READ, 'E', 0x20+EV_KEY, len)
-	req := uintptr(2<<30 | len(bits)<<16 | 'E'<<8 | (0x20 + evKey))
+	req := uintptr(2)<<30 |
+		uintptr(len(bits))<<16 |
+		uintptr('E')<<8 |
+		uintptr(0x20+evKey)
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req,
 		uintptr(unsafe.Pointer(&bits[0]))); errno != 0 {
 		return false
@@ -139,19 +143,18 @@ func readEvdev(f *os.File, ch chan<- Event) {
 			return
 		}
 		for off := 0; off+inputEventSize <= n; off += inputEventSize {
-			var ev inputEvent
-			ev.Type = binary.LittleEndian.Uint16(buf[off+16:])
-			ev.Code = binary.LittleEndian.Uint16(buf[off+18:])
-			ev.Value = int32(binary.LittleEndian.Uint32(buf[off+20:]))
-			if ev.Type != evKey {
+			typ := binary.NativeEndian.Uint16(buf[off+inputEventTypeOffset:])
+			code := binary.NativeEndian.Uint16(buf[off+inputEventCodeOffset:])
+			value := int32(binary.NativeEndian.Uint32(buf[off+inputEventValueOffset:]))
+			if typ != evKey {
 				continue
 			}
-			dir, ok := evdevKeys[ev.Code]
+			dir, ok := evdevKeys[code]
 			if !ok {
 				continue
 			}
 			out := Event{Kind: EvKey, Src: SrcDevice, Dir: dir}
-			switch ev.Value {
+			switch value {
 			case 0:
 				out.KeyAct = KeyRelease
 			case 1:

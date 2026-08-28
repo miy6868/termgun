@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/binary"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -24,11 +25,16 @@ func TestEvdevDecoding(t *testing.T) {
 
 	write := func(typ, code uint16, value int32) {
 		var b [inputEventSize]byte
-		binary.LittleEndian.PutUint64(b[0:], 12345) // tv_sec
-		binary.LittleEndian.PutUint64(b[8:], 678)   // tv_usec
-		binary.LittleEndian.PutUint16(b[16:], typ)  // type
-		binary.LittleEndian.PutUint16(b[18:], code) // code
-		binary.LittleEndian.PutUint32(b[20:], uint32(value))
+		if inputEventTimevalSize == 8 {
+			binary.NativeEndian.PutUint32(b[0:], 12345) // tv_sec
+			binary.NativeEndian.PutUint32(b[4:], 678)   // tv_usec
+		} else {
+			binary.NativeEndian.PutUint64(b[0:], 12345) // tv_sec
+			binary.NativeEndian.PutUint64(b[8:], 678)   // tv_usec
+		}
+		binary.NativeEndian.PutUint16(b[inputEventTypeOffset:], typ)
+		binary.NativeEndian.PutUint16(b[inputEventCodeOffset:], code)
+		binary.NativeEndian.PutUint32(b[inputEventValueOffset:], uint32(value))
 		if _, err := w.Write(b[:]); err != nil {
 			t.Error(err)
 		}
@@ -71,5 +77,52 @@ func TestEvdevDecoding(t *testing.T) {
 			t.Errorf("unexpected extra event %+v", ev)
 		}
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestTerminationSignalStopsEventLoop(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	events := make(chan Event, 1)
+	go forwardTermination(signals, events)
+	signals <- syscall.SIGTERM
+
+	select {
+	case ev := <-events:
+		if ev.Kind != EvStop {
+			t.Fatalf("termination produced %v, want EvStop", ev.Kind)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("termination did not stop the event loop")
+	}
+}
+
+// TestTTYEOFLeavesSharedChannelOpen covers the channel ownership rule. The TTY
+// reader can end while SIGWINCH or evdev still has an event to publish.
+func TestTTYEOFLeavesSharedChannelOpen(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	ch := make(chan Event, 2)
+	go readTTYEvents(r, nil, ch)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-ch:
+		if ev.Kind != EvStop {
+			t.Fatalf("TTY EOF produced %v, want EvStop", ev.Kind)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TTY EOF did not stop the event stream")
+	}
+
+	// A second producer must still be able to use the shared channel.
+	ch <- Event{Kind: EvResize, W: 80, H: 24}
+	if ev := <-ch; ev.Kind != EvResize {
+		t.Fatalf("event after TTY EOF = %v, want EvResize", ev.Kind)
 	}
 }

@@ -21,6 +21,8 @@ Linux와 Windows 10 이상입니다. Windows에서는 UTF-8과 ANSI 색상을 �
 [Windows Terminal](https://github.com/microsoft/terminal)을 권장합니다. PowerShell이나
 명령 프롬프트에서 직접 빌드하거나, Linux에서
 `GOOS=windows GOARCH=amd64 go build -o termgun.exe .`로 교차 빌드할 수 있습니다.
+`-fps`는 15~1000, `-zoom`은 1~4 범위이며 잘못된 옵션 값은 실행 전에 오류로
+보고됩니다.
 
 ## 조작
 

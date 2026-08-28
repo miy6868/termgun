@@ -5,12 +5,39 @@ package main
 import (
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
-// readEvents parses stdin in a goroutine and publishes decoded events onto ch.
-// The caller owns the channel because other input sources — the kernel keyboard
-// reader — publish onto the same one.
+type terminationSource struct {
+	signals chan os.Signal
+	close   sync.Once
+}
+
+// watchTermination turns process termination into an ordinary application
+// event so deferred terminal restoration still runs.
+func watchTermination(events chan<- Event) inputSource {
+	s := &terminationSource{signals: make(chan os.Signal, 1)}
+	signal.Notify(s.signals, syscall.SIGTERM, syscall.SIGHUP)
+	go forwardTermination(s.signals, events)
+	return s
+}
+
+func forwardTermination(signals <-chan os.Signal, events chan<- Event) {
+	if _, ok := <-signals; ok {
+		events <- Event{Kind: EvStop}
+	}
+}
+
+func (s *terminationSource) Close() {
+	s.close.Do(func() {
+		signal.Stop(s.signals)
+		close(s.signals)
+	})
+}
+
+// readEvents publishes decoded events onto ch. No producer closes the channel:
+// stdin, SIGWINCH, and the kernel keyboard reader all share it.
 func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
@@ -21,36 +48,38 @@ func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 		}
 	}()
 
-	go func() {
-		// Anything typed during the capability handshake is replayed first.
-		buf := append(make([]byte, 0, 1024), leftover...)
-		tmp := make([]byte, 512)
-		for {
-			n, err := in.Read(tmp)
-			if n > 0 {
-				buf = append(buf, tmp[:n]...)
-				for {
-					ev, used, ok := parseEvent(buf)
-					if !ok {
-						break
-					}
-					buf = buf[used:]
-					if ev.Kind != EvKey || ev.Key != KeyNone || ev.Rune != 0 {
-						ch <- ev
-					}
+	go readTTYEvents(in, leftover, ch)
+}
+
+func readTTYEvents(in *os.File, leftover []byte, ch chan<- Event) {
+	// Anything typed during the capability handshake is replayed first.
+	buf := append(make([]byte, 0, 1024), leftover...)
+	tmp := make([]byte, 512)
+	for {
+		n, err := in.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			for {
+				ev, used, ok := parseEvent(buf)
+				if !ok {
+					break
 				}
-				// Drop a lone dangling ESC-prefixed fragment that never
-				// completed; otherwise a partial sequence would wedge parsing.
-				if len(buf) > 64 {
-					buf = buf[:0]
+				buf = buf[used:]
+				if ev.Kind != EvKey || ev.Key != KeyNone || ev.Rune != 0 {
+					ch <- ev
 				}
 			}
-			if err != nil {
-				close(ch)
-				return
+			// Drop a lone dangling ESC-prefixed fragment that never completed;
+			// otherwise a partial sequence would wedge parsing.
+			if len(buf) > 64 {
+				buf = buf[:0]
 			}
 		}
-	}()
+		if err != nil {
+			ch <- Event{Kind: EvStop}
+			return
+		}
+	}
 }
 
 // chooseInput picks the best key-state source available.

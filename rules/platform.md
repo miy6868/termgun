@@ -7,6 +7,7 @@ Windows 파일과 교차 빌드를 함께 검증한다.
 
 | 역할 | 파일 |
 |---|---|
+| 공통 플랫폼 세션 | `platform.go` |
 | 터미널 제어 | `term_linux.go` |
 | 입력 루프 | `input_linux.go` |
 | 키 디코딩 | `evdev.go` |
@@ -24,6 +25,10 @@ Windows 파일과 교차 빌드를 함께 검증한다.
 - Linux `auto` 입력은 kitty 프로토콜, `/dev/input`, 호환 모드 순으로 선택한다.
 - `/dev/input`에서는 이동키만 읽고 포커스를 잃으면 누른 키를 모두 놓고 입력을 무시한다.
 - 호환 모드는 자동반복 지연을 보정하되 마지막으로 누른 반대 방향 키가 이기게 한다.
+- 이벤트 채널은 여러 생산자가 공유하므로 생산자가 닫지 않는다. 주 입력 소스 종료는
+  `EvStop`으로 알린다.
+- Linux `SIGTERM`과 `SIGHUP`은 `EvStop`으로 바꾸어 터미널 복구 후 종료한다.
+- evdev 정수는 커널의 native endian으로 디코딩한다.
 
 macOS는 `syscall.TCGETS` 때문에 현재 지원하지 않는다. 검증 환경 없이 지원을 추정해
 추가하지 않는다.

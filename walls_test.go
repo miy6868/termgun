@@ -12,8 +12,8 @@ import (
 
 // TestNothingTunnelsThroughAWall covers the second one. Collision resolves a
 // whole frame of movement in one go and only ever tests the destination, so a
-// long enough step skips everything in between. main.go caps a stalled frame at
-// 0.1s and says in a comment that this stops entities teleporting through
+// long enough step skips everything in between. The application loop caps a
+// stalled frame at 0.1s and says in a comment that this stops entities teleporting through
 // walls — but 0.1s of dash is 5.1 tiles, which clears a two-tile wall outright.
 func TestNothingTunnelsThroughAWall(t *testing.T) {
 	dash := func(dt float64) (float64, float64) {
@@ -151,7 +151,7 @@ func TestNobodyEndsUpInsideAWall(t *testing.T) {
 			// Stall every so often. A steady 1/60 never produces a step long
 			// enough to skip a wall, so a soak that only ever runs at a clean
 			// frame rate cannot find the bug this test exists for. 0.1s is the
-			// worst frame main.go will pass through.
+			// worst frame the application loop will pass through.
 			dt := 1.0 / 60
 			if frame%97 == 0 {
 				dt = 0.1

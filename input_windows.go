@@ -29,13 +29,19 @@ const (
 	waitMouseFlushMS = 8
 )
 
+// Windows console control keys arrive through ReadConsoleInput. There is no
+// separate POSIX-style termination signal source to register here.
+func watchTermination(events chan<- Event) inputSource { return nil }
+
 // readEvents pumps console records onto ch. leftover is unused: nothing was
 // read ahead of this point, because there is no capability handshake to run.
 func readEvents(in *os.File, fd int, leftover []byte, ch chan Event) {
 	handle := uintptr(fd)
 
 	go func() {
-		defer close(ch)
+		// Keep channel ownership out of producers so adding another Windows
+		// source cannot create the close-while-sending race Linux used to have.
+		defer func() { ch <- Event{Kind: EvStop} }()
 		held := winKeyState{}
 		var buttons uint32
 		recs := make([]winRecord, 64)

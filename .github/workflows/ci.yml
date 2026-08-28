@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Race test
+        run: go test -race -count=1 ./...
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Build
+        run: go build -o termgun.exe .
+
+  architectures:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: "386"
+            run_tests: true
+          - goos: linux
+            goarch: arm64
+            run_tests: false
+          - goos: linux
+            goarch: ppc64
+            run_tests: false
+          - goos: linux
+            goarch: s390x
+            run_tests: false
+          - goos: windows
+            goarch: arm64
+            run_tests: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Test
+        if: matrix.run_tests
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go test -count=1 ./...
+      - name: Compile tests
+        if: ${{ !matrix.run_tests }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go test -c -o "${RUNNER_TEMP}/termgun-${{ matrix.goos }}-${{ matrix.goarch }}.test" .
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -o "${RUNNER_TEMP}/termgun-${{ matrix.goos }}-${{ matrix.goarch }}" .

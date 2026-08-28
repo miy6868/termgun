@@ -30,3 +30,5 @@
 - `bench_test.go`: 프레임 비용과 할당 예산.
 
 전체 검증은 `AGENTS.md`의 명령을 그대로 사용한다.
+GitHub Actions는 Linux의 포맷·vet·일반/race 테스트, Windows 실제 runner 테스트,
+지원 아키텍처의 실행 또는 교차 컴파일을 함께 검사한다.
