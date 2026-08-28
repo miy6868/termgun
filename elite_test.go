@@ -162,6 +162,27 @@ func TestEliteAuraBuffsNeighbours(t *testing.T) {
 	}
 }
 
+// TestEliteAuraBuffsRangedDamage keeps the aura's damage bonus on projectiles,
+// not just contact attacks. Shooters and turrets are ordinary aura targets too.
+func TestEliteAuraBuffsRangedDamage(t *testing.T) {
+	g := arena(t, 28)
+	addElite(g, enemyDefs[0], Vec{20.5, 4.5}, EliteAura)
+	g.addEnemy(enemyDefs[4], Vec{21.5, 4.5}) // Turret: ranged damage only.
+
+	g.updateElite(&g.enemies[0], 1.0/60)
+	shooter := &g.enemies[1]
+	if shooter.buffed <= 0 {
+		t.Fatal("the nearby turret was not aura-buffed")
+	}
+	g.enemyShot(shooter, Vec{1, 0}, 0)
+
+	got := g.bullets[len(g.bullets)-1].dmg
+	want := shooter.damage()
+	if got != want {
+		t.Fatalf("aura-buffed turret shot deals %.1f damage, want %.1f", got, want)
+	}
+}
+
 // TestElitesAppearWithDepth checks the pacing: none on the first floor, and a
 // real chance later.
 func TestElitesAppearWithDepth(t *testing.T) {

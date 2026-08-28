@@ -233,6 +233,41 @@ func TestPlayfieldIsNarrow(t *testing.T) {
 	}
 }
 
+// TestUIAvoidsAmbiguousWidthGlyphs keeps the screen buffer and CJK terminals
+// in agreement. Hangul has a stable width of two and ASCII a stable width of
+// one, but symbols such as arrows and the middle dot are locale-dependent.
+// If one reaches an overlay, every cell after it can be shifted on a Korean
+// terminal even though the renderer believes the row is aligned.
+func TestUIAvoidsAmbiguousWidthGlyphs(t *testing.T) {
+	g := NewGame(12)
+	s := newTestScreen(120, 44)
+	cases := []struct {
+		state State
+		page  int
+	}{
+		{StatePlaying, 0},
+		{StateHelp, 0},
+		{StateHelp, 1},
+		{StateHelp, 2},
+		{StateSettings, 0},
+		{StatePaused, 0},
+		{StateDead, 0},
+	}
+	for _, tc := range cases {
+		g.state, g.helpPage = tc.state, tc.page
+		g.Draw(s)
+		for y := 0; y < s.H; y++ {
+			for x := 0; x < s.W; x++ {
+				r := s.cur[y*s.W+x].R
+				if r > 0x7f && (r < 0xac00 || r > 0xd7a3) {
+					t.Fatalf("state %d page %d: locale-dependent glyph %q at (%d,%d)",
+						tc.state, tc.page, r, x, y)
+				}
+			}
+		}
+	}
+}
+
 func TestRuneWidth(t *testing.T) {
 	for _, c := range []struct {
 		r rune

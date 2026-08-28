@@ -104,7 +104,11 @@ func detectKitty(fd int, out *bufio.Writer) (supported bool, leftover []byte) {
 				dropDA1(buf, i)
 		}
 	}
-	return kittyReplyBefore(buf), nil
+	// Without DA1 there is no reliable boundary between terminal replies and
+	// keys typed during the probe. Replay the whole buffer: completed replies
+	// decode to KeyNone and are filtered by readTTYEvents, while retaining it is
+	// the only way to avoid dropping real user input.
+	return kittyReplyBefore(buf), buf
 }
 
 type winsize struct {

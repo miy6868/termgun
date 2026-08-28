@@ -3,11 +3,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // TestEvdevDecoding feeds the exact byte layout the kernel produces through the
@@ -124,5 +127,51 @@ func TestTTYEOFLeavesSharedChannelOpen(t *testing.T) {
 	ch <- Event{Kind: EvResize, W: 80, H: 24}
 	if ev := <-ch; ev.Kind != EvResize {
 		t.Fatalf("event after TTY EOF = %v, want EvResize", ev.Kind)
+	}
+}
+
+// TestKittyProbeTimeoutPreservesInput covers terminals that do not answer DA1.
+// Keystrokes typed during the bounded capability probe still belong to the
+// normal input stream even when no terminal reply marks the end of the probe.
+func TestKittyProbeTimeoutPreservesInput(t *testing.T) {
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+
+	var unlock int32
+	if err := ioctl(int(master.Fd()), syscall.TIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
+		t.Fatal(err)
+	}
+	var number uint32
+	if err := ioctl(int(master.Fd()), syscall.TIOCGPTN, unsafe.Pointer(&number)); err != nil {
+		t.Fatal(err)
+	}
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slave.Close()
+
+	state, err := enterRaw(int(slave.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.restore()
+
+	// Queue the keys before the probe starts instead of racing a writer against
+	// the probe's deliberate 300 ms timeout. They are still bytes consumed by
+	// the capability probe, which is the boundary this test exercises.
+	if _, err := master.Write([]byte("wd")); err != nil {
+		t.Fatal(err)
+	}
+
+	supported, leftover := detectKitty(int(slave.Fd()), bufio.NewWriter(slave))
+	if supported {
+		t.Fatal("plain user input was mistaken for a kitty reply")
+	}
+	if string(leftover) != "wd" {
+		t.Fatalf("input typed during probe = %q, want %q", leftover, "wd")
 	}
 }

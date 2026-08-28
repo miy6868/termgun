@@ -50,3 +50,28 @@ func TestMatriarchSummonsBrood(t *testing.T) {
 		}
 	}
 }
+
+// Summoning can grow the enemy slice. The boss's own state must still be
+// written back when that append moves the slice to a new backing array;
+// otherwise it summons again every frame because its cooldown never sticks.
+func TestMatriarchSummonPreservesBossState(t *testing.T) {
+	g := arena(t, 34)
+	g.addEnemy(queenDef, Vec{25.5, 4.5})
+	g.enemies[0].alert = true
+	g.enemies[0].phase = 0.1 // brood script
+
+	// Force the brood append to reallocate, which exposes stale Enemy pointers.
+	g.enemies = append([]Enemy(nil), g.enemies...)
+	g.Update(1.0 / 60)
+
+	q := enemyByName(g, queenDef.Name)
+	if q == nil {
+		t.Fatal("the MATRIARCH disappeared while summoning")
+	}
+	if q.cool <= 0 {
+		t.Fatal("the summon cooldown was lost when the enemy slice grew")
+	}
+	if q.phase <= 0.1 {
+		t.Fatal("the boss phase update was lost when the enemy slice grew")
+	}
+}

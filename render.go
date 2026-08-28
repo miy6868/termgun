@@ -1094,7 +1094,7 @@ func (g *Game) drawHelp(s *Screen) {
 		"벗어나세요. 돌진을 피하면 벽에 부딪혀 잠시 무방비(x)가 됩니다. 자폭병(b)의",
 		"심지는 한 번 붙으면 꺼지지 않으니, 샷건 넉백으로 밀어내는 것도 방법입니다.",
 		"",
-		"정예(대문자·다른 색): " + padRight("재생", 8) + eliteDefs[EliteRegen].Short,
+		"정예(대문자/다른 색): " + padRight("재생", 8) + eliteDefs[EliteRegen].Short,
 		"                      " + padRight("분열", 8) + eliteDefs[EliteSplit].Short,
 		"                      " + padRight("폭발", 8) + eliteDefs[EliteBurst].Short,
 		"                      " + padRight("지휘", 8) + eliteDefs[EliteAura].Short,
@@ -1146,7 +1146,7 @@ func (g *Game) drawSettings(s *Screen) {
 		row(3, fmt.Sprintf("화면 흔들림                         %s", settingStatus(g.screenShake))),
 		row(4, fmt.Sprintf("화면 배율                         x%d", g.zoom)),
 		"",
-		"↑/↓ 항목 선택 / ←/→ 조정 / O 또는 ESC로 돌아가기",
+		"^/v 항목 선택 / <-/-> 조정 / O 또는 ESC로 돌아가기",
 	}
 	g.drawCenterBox(s, "설 정", lines, colHUDAccent)
 }

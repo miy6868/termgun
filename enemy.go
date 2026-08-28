@@ -472,7 +472,7 @@ func (g *Game) enemyShot(e *Enemy, dir Vec, spread float64) {
 	g.bullets = append(g.bullets, Bullet{
 		pos:   e.pos,
 		vel:   dir.unvisual().Scale(e.def.BulletSp),
-		dmg:   e.def.Damage,
+		dmg:   e.damage(),
 		life:  2.4,
 		glyph: 'o',
 		color: 203,

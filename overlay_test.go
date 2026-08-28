@@ -63,7 +63,7 @@ func TestSettingsToggleAndSurviveRestart(t *testing.T) {
 	}
 	g.Draw(s)
 	text := overlayText(s)
-	for _, want := range []string{"> 포커스", "자동 일시 정지", "현재 시드 표시", "자동 무기 변경", "화면 흔들림", "화면 배율", "↑/↓", "←/→"} {
+	for _, want := range []string{"> 포커스", "자동 일시 정지", "현재 시드 표시", "자동 무기 변경", "화면 흔들림", "화면 배율", "^/v", "<-/->"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("settings page does not show %q", want)
 		}

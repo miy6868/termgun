@@ -808,7 +808,14 @@ func (g *Game) Update(dt float64) {
 	g.updateBullets(dt)
 
 	for i := range g.enemies {
-		g.updateEnemy(&g.enemies[i], dt)
+		e := &g.enemies[i]
+		g.updateEnemy(e, dt)
+		// Boss attacks can append summons and move the slice to a new backing
+		// array. Preserve the boss updates made through the old pointer; later
+		// iterations already index the current slice and need no correction.
+		if e != &g.enemies[i] {
+			g.enemies[i] = *e
+		}
 	}
 	g.separateEnemies()
 	g.reapEnemies()
