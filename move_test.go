@@ -100,6 +100,33 @@ func TestReleaseStopsImmediately(t *testing.T) {
 	}
 }
 
+func TestResponsiveVelocityStartsStopsAndReverses(t *testing.T) {
+	top := 15.0
+	right := Vec{X: top}
+
+	started := steerMovementVelocity(Vec{}, right, 1.0/60)
+	if started.X < top*0.4 {
+		t.Fatalf("first movement frame reached %.1f%% speed; start still feels delayed",
+			started.X/top*100)
+	}
+
+	stopped := steerMovementVelocity(right, Vec{}, 1.0/60)
+	if stopped.len() > top*0.1 {
+		t.Fatalf("release kept %.1f%% speed; stop still slides", stopped.len()/top*100)
+	}
+
+	reversed := steerMovementVelocity(right, right.Scale(-1), 1.0/60)
+	if reversed.X >= 0 {
+		t.Fatalf("one-frame reversal still moved right at %.2f", reversed.X)
+	}
+
+	diagonal := Vec{X: top, Y: -top}
+	horizontal := steerMovementVelocity(diagonal, right, 1.0/60)
+	if math.Abs(horizontal.Y) > top*0.1 || horizontal.X < top*0.9 {
+		t.Fatalf("dropping one diagonal axis produced %v; released axis did not brake alone", horizontal)
+	}
+}
+
 // TestLegacyHoldBridgesRepeatDelay covers the compatibility path: a key must
 // still count as held across the gap before the OS starts auto-repeating,
 // otherwise movement stutters after the first step.
@@ -156,6 +183,24 @@ func TestKittyKeyParsing(t *testing.T) {
 		if ev.Rune != c.rune || ev.Key != c.key || ev.KeyAct != c.action {
 			t.Errorf("%q: got rune=%q key=%v action=%v, want rune=%q key=%v action=%v",
 				c.in, ev.Rune, ev.Key, ev.KeyAct, c.rune, c.key, c.action)
+		}
+	}
+}
+
+func TestMouseWheelParsingKeepsDirection(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want int
+	}{
+		{"\x1b[<64;20;10M", BtnWheelUp},
+		{"\x1b[<65;20;10M", BtnWheelDown},
+	} {
+		ev, used, ok := parseEvent([]byte(c.in))
+		if !ok || used != len(c.in) {
+			t.Fatalf("%q: parse failed (ok=%v used=%d)", c.in, ok, used)
+		}
+		if ev.Kind != EvMouse || ev.Action != MousePress || ev.Button != c.want {
+			t.Errorf("%q: decoded as %+v, want wheel button %d", c.in, ev, c.want)
 		}
 	}
 }
@@ -270,8 +315,10 @@ func TestUnfocusedDeviceInputIgnored(t *testing.T) {
 		t.Fatalf("unfocused keystroke moved the player %v", d)
 	}
 
-	// Focus returns and input works again.
+	// Focus returns without silently resuming. Input works again only after the
+	// player explicitly leaves the auto-pause overlay.
 	g.HandleEvent(Event{Kind: EvFocus, Focus: true})
+	g.HandleEvent(Event{Kind: EvKey, Src: SrcTTY, Rune: 'p', KeyAct: KeyPress})
 	g.HandleEvent(Event{Kind: EvKey, Src: SrcDevice, Dir: dirLeft, KeyAct: KeyPress})
 	if d := g.moveDir(); !approx(d.X, -1) {
 		t.Fatalf("input did not resume after regaining focus: %v", d)

@@ -1,5 +1,7 @@
 package main
 
+import "unicode/utf8"
+
 // Terminals draw East Asian Wide and Fullwidth characters across two columns.
 // The renderer has to agree with the terminal about that, otherwise every line
 // containing Hangul shifts and the diff buffer stops matching what is actually
@@ -55,6 +57,19 @@ func strWidth(s string) int {
 	w := 0
 	for _, r := range s {
 		w += runeWidth(r)
+	}
+	return w
+}
+
+// bytesWidth is strWidth for scratch labels assembled directly into UTF-8
+// bytes. Decoding the slice directly avoids the heap-backed conversion that a
+// helper call around range(string(b)) otherwise triggers.
+func bytesWidth(b []byte) int {
+	w := 0
+	for len(b) > 0 {
+		r, n := utf8.DecodeRune(b)
+		w += runeWidth(r)
+		b = b[n:]
 	}
 	return w
 }

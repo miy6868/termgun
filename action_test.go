@@ -57,14 +57,14 @@ func TestPerfectDodgeRewardsTheTiming(t *testing.T) {
 	g.aim = p.pos.Add(Vec{1, 0})
 
 	g.startDash()
-	cd := p.dashCD
+	energy := p.dashEnergy
 	g.damagePlayer(10, Vec{1, 0})
 
-	if !p.dodgedThisDash {
+	if !p.dodgedThisChain {
 		t.Fatal("a hit landing inside a fresh dash was not graded as a perfect dodge")
 	}
-	if p.dashCD >= cd {
-		t.Errorf("the gauge was not refunded (%.2f -> %.2f)", cd, p.dashCD)
+	if p.dashEnergy <= energy {
+		t.Errorf("the gauge was not refunded (%.2f -> %.2f)", energy, p.dashEnergy)
 	}
 	if g.hitStop <= 0 {
 		t.Error("no bullet time was granted")
@@ -75,19 +75,21 @@ func TestPerfectDodgeRewardsTheTiming(t *testing.T) {
 
 	// One reward per dash: riding a burst of hits must not print it in bulk.
 	g.hitStop = 0
-	cd = p.dashCD
+	energy = p.dashEnergy
 	g.damagePlayer(10, Vec{1, 0})
-	if p.dashCD != cd || g.hitStop > 0 {
-		t.Error("the perfect dodge paid out twice on one dash")
+	if p.dashEnergy != energy || g.hitStop > 0 {
+		t.Error("the perfect dodge paid out twice in one chain")
 	}
 
 	// And outside the window it never fires at all.
+	p.dashTimer, p.dashRecovery, p.invuln = 0, 0, 0
+	p.dashChainTimer, p.dodgedThisChain = 0, false
 	g.startDash()
 	p.lastDashStart -= perfectDodgeWindow + 0.01
-	before := p.dashCD
+	before := p.dashEnergy
 	g.hitStop = 0
 	g.damagePlayer(10, Vec{1, 0})
-	if p.dashCD != before || g.hitStop > 0 {
+	if p.dashEnergy != before || g.hitStop > 0 {
 		t.Error("a stale dash still counted as a perfect dodge")
 	}
 }
@@ -161,5 +163,61 @@ func TestPacksSurroundInsteadOfQueueing(t *testing.T) {
 			t.Errorf("grunt %d never closed in (%.1f tiles away); "+
 				"flanking turned into stalling", i, d)
 		}
+	}
+}
+
+func TestWeaponWheelSkipsUnavailableSlots(t *testing.T) {
+	g := arena(t, 40)
+	p := &g.player
+	p.owned[wpSMG] = true
+	p.ammo[wpSMG] = 0
+	p.owned[wpShotgun] = true
+	p.ammo[wpShotgun] = 4
+
+	g.cycleWeapon(1)
+	if p.weapon != wpShotgun {
+		t.Fatalf("wheel selected %s, want available Shotgun", weapons[p.weapon].Name)
+	}
+	g.cycleWeapon(-1)
+	if p.weapon != wpPistol {
+		t.Fatalf("reverse wheel selected %s, want Pistol", weapons[p.weapon].Name)
+	}
+}
+
+func TestQuickMeleeKeepsEquippedWeapon(t *testing.T) {
+	g := arena(t, 41)
+	p := &g.player
+	p.weapon = wpPistol
+	g.mouseSet = true
+	g.aim = p.pos.Add(Vec{X: 1})
+	g.addEnemy(enemyDefs[5], p.pos.Add(Vec{X: 1}))
+	before := g.enemies[0].hp
+	p.cooldown = 0.04
+
+	g.HandleEvent(Event{Kind: EvKey, Rune: 'f', KeyAct: KeyPress})
+	g.Update(0.02)
+	if g.enemies[0].hp != before {
+		t.Fatal("quick melee ignored the active weapon cooldown")
+	}
+	g.Update(0.03)
+
+	if g.enemies[0].hp >= before {
+		t.Fatal("quick melee did not hit the enemy in front")
+	}
+	if p.weapon != wpPistol {
+		t.Fatalf("quick melee left %s equipped, want Pistol", weapons[p.weapon].Name)
+	}
+}
+
+func TestReleasingAnotherMouseButtonDoesNotCancelFire(t *testing.T) {
+	g := arena(t, 42)
+	g.firing = true
+	g.handleMouse(Event{Kind: EvMouse, Action: MouseRelease, Button: BtnRight})
+	if !g.firing {
+		t.Fatal("releasing the dash button cancelled a held left trigger")
+	}
+	g.handleMouse(Event{Kind: EvMouse, Action: MouseRelease, Button: BtnLeft})
+	if g.firing {
+		t.Fatal("releasing the left trigger did not stop firing")
 	}
 }

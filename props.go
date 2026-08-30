@@ -162,12 +162,12 @@ func (g *Game) acidBubbles() {
 	for y := maxInt(py-18, 0); y <= minInt(py+18, lv.H-1) && n < 3; y++ {
 		for x := maxInt(px-24, 0); x <= minInt(px+24, lv.W-1) && n < 3; x++ {
 			i := y*lv.W + x
-			if lv.tiles[i] != TileAcid || !lv.visible[i] || g.rng.Float64() >= acidBubbleChance {
+			if lv.tiles[i] != TileAcid || !lv.visible[i] || g.fxRNG.Float64() >= acidBubbleChance {
 				continue
 			}
 			n++
 			g.parts = append(g.parts, Particle{
-				pos:  Vec{float64(x) + g.rng.Float64(), float64(y) + g.rng.Float64()},
+				pos:  Vec{float64(x) + g.fxRNG.Float64(), float64(y) + g.fxRNG.Float64()},
 				vel:  Vec{0, -0.8},
 				life: 0.6, max: 0.6,
 				glyph: '`', color: 47,

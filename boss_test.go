@@ -2,9 +2,7 @@ package main
 
 import "testing"
 
-// Boss floors alternate scripts: the OVERSEER owns the x5 floors, the
-// MATRIARCH the x10 ones. The alternation is the point — a bigger version of
-// the same boss is not a new question.
+// The first two act bosses teach their own scripts and B15 has a final owner.
 
 func TestBossFloorsAlternate(t *testing.T) {
 	g := NewGame(7)
@@ -14,7 +12,7 @@ func TestBossFloorsAlternate(t *testing.T) {
 	}{
 		{5, "OVERSEER"},
 		{10, "MATRIARCH"},
-		{15, "OVERSEER"},
+		{15, "CORE WARDEN"},
 	} {
 		g.enterDepth(tc.depth)
 		b := g.bossEnemy()
@@ -24,6 +22,18 @@ func TestBossFloorsAlternate(t *testing.T) {
 		if b.def.Name != tc.want {
 			t.Errorf("B%d spawned %s, want %s", tc.depth, b.def.Name, tc.want)
 		}
+	}
+}
+
+func TestCoreWardenFiresDistinctDoubleRing(t *testing.T) {
+	g := arena(t, 35)
+	g.addEnemy(coreBossDef, Vec{25.5, 4.5})
+	c := &g.enemies[0]
+	c.alert = true
+	c.phase = 0.1
+	g.coreAttack(c, Vec{1, 0})
+	if len(g.bullets) != 24 {
+		t.Fatalf("CORE WARDEN double ring fired %d bullets, want 24", len(g.bullets))
 	}
 }
 

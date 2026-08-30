@@ -12,10 +12,12 @@ type State int
 const (
 	StatePlaying State = iota
 	StateLevelUp
+	StateWeaponCore
 	StateHelp
 	StateSettings
 	StatePaused
 	StateDead
+	StateVictory
 	StateQuit
 )
 
@@ -63,9 +65,11 @@ func (m InputMode) String() string {
 }
 
 type Game struct {
-	rng   *rand.Rand
+	rng   *rand.Rand // simulation: generation, combat, loot and AI
+	fxRNG *rand.Rand // presentation only; draw cadence must not change a run
 	state State
 	seed  int64
+	hud   hudScratch
 
 	level   *Level
 	depth   int
@@ -83,15 +87,23 @@ type Game struct {
 	enemyBuf  []Enemy
 
 	// input
-	inputMode InputMode
-	focused   bool      // terminal has focus; device input is ignored when not
-	move      *movement // keyboard direction state
-	aim       Vec       // world position the mouse points at
-	firing    bool
-	mouseSet  bool
+	inputMode     InputMode
+	focused       bool      // terminal has focus; device input is ignored when not
+	move          *movement // keyboard direction state
+	aim           Vec       // world position the mouse points at
+	firing        bool
+	mouseSet      bool
+	quickMeleeBuf float64
 
 	// presentation
 	camX, camY float64
+	// Previous rendered player cells let a camera already tracking one axis
+	// absorb a newly added diagonal component without mixing world scroll and
+	// player drift on the other axis.
+	camPlayerX, camPlayerY, camPlayerZoom int
+	camPlayerTilesW, camPlayerTilesH      int
+	camLockX, camLockY                    int
+	camPlayerSet                          bool
 	// viewport rectangle on screen, in terminal cells (set each frame by Draw)
 	viewX, viewY, viewW, viewH int
 	// zoom is the requested cells-per-tile; zoomEff is what the current terminal
@@ -119,9 +131,13 @@ type Game struct {
 	showSeed    bool
 	autoWeapon  bool
 	screenShake bool
+	debugPerf   bool
+	perf        perfStats
 	settingRow  int
 
 	perkChoices []Perk
+	coreChoices []WeaponCore
+	coreWeapon  int
 
 	score     int
 	kills     int
@@ -140,6 +156,12 @@ type Game struct {
 	floorTime  float64
 	reinfTimer float64
 	reinfWaves int
+	// Objective hints advance only while the floor is open. Sealed ambush
+	// rooms suspend the search clock so their mandatory fight does not reveal
+	// the exit for free.
+	objectiveHintTime float64
+	objectiveHintTick float64
+	objectiveHint     int
 
 	// interactive terrain
 	barrels  []Barrel
@@ -154,6 +176,7 @@ func NewGame(seed int64) *Game {
 func newGameWithInput(seed int64, mode InputMode) *Game {
 	g := &Game{
 		rng:         rand.New(rand.NewSource(seed)),
+		fxRNG:       rand.New(rand.NewSource(seed ^ -7046029254386353131)),
 		seed:        seed,
 		player:      newPlayer(),
 		inputMode:   mode,
@@ -181,7 +204,7 @@ func (g *Game) enterDepth(depth int) {
 	g.parts = g.parts[:0]
 	g.pickups = g.pickups[:0]
 	g.floaters, g.decals = g.floaters[:0], g.decals[:0]
-	g.hitStop, g.fireBuf = 0, 0
+	g.hitStop, g.fireBuf, g.quickMeleeBuf = 0, 0, 0
 
 	start := g.level.rooms[0]
 	sx, sy := start.center()
@@ -206,10 +229,11 @@ func (g *Game) enterDepth(depth int) {
 	}
 	if boss {
 		def := bossDef
-		// Boss floors alternate scripts: the OVERSEER owns B5, B15, ... while
-		// the MATRIARCH takes B10, B20, ... so the even tiers ask a different
-		// question instead of a bigger version of the same one.
-		if (depth/5)%2 == 0 {
+		// The existing bosses close the first two acts. B15 gets its own owner,
+		// so the campaign ends on a new question instead of another rotation.
+		if depth == campaignDepth {
+			def = coreBossDef
+		} else if (depth/5)%2 == 0 {
 			def = queenDef
 		}
 		def.HP *= 1 + float64(depth)*0.35
@@ -248,12 +272,16 @@ func (g *Game) enterDepth(depth int) {
 	g.ambushRoom, g.ambushOn, g.ambushDone, g.ambushWave = -1, false, false, 0
 	g.ambushDoors, g.shrine = nil, nil
 	g.floorTime, g.reinfTimer, g.reinfWaves = 0, reinforceEvery, 0
+	g.objectiveHintTime, g.objectiveHintTick, g.objectiveHint = 0, 0, 0
+	g.camPlayerSet = false
+	g.camLockX, g.camLockY = 0, 0
 	g.acidTick = 0
 	g.placeBarrels(sx, sy)
 	g.assignRooms(0, g.level.RoomAt(g.stairsPos))
 
 	g.level.ComputeFOV(int(g.player.pos.X), int(g.player.pos.Y), 15)
 	g.level.BuildFlow(int(g.player.pos.X), int(g.player.pos.Y))
+	g.log(fmt.Sprintf("B%d %s 진입", depth, actName(depth)), 117)
 }
 
 func (g *Game) rollEnemy(depth int) (EnemyDef, bool) {
@@ -377,7 +405,7 @@ func (g *Game) addEnemy(def EnemyDef, pos Vec) {
 	}
 	g.enemies = append(g.enemies, Enemy{
 		id: g.nextID, def: &d, pos: pos, hp: def.HP, maxHP: def.HP,
-		phase: g.rng.Float64() * 10, flank: flank,
+		phase: g.rng.Float64() * 10, flank: flank, lastHitWeapon: -1, lastDashHit: -999,
 	})
 }
 
@@ -399,9 +427,16 @@ func (g *Game) HandleEvent(ev Event) {
 	case EvKey:
 		directionMenu := g.state == StateHelp || g.state == StateSettings
 		if ev.Src == SrcDevice {
-			if !directionMenu {
-				g.handleDeviceKey(ev)
+			if g.state != StatePlaying {
+				// Device directions must not affect a modal screen, but their
+				// releases still have to clear keys held before it opened. Dropping
+				// the release makes the player bolt away when play resumes.
+				if ev.KeyAct == KeyRelease {
+					g.move.release(ev.Dir)
+				}
+				return
 			}
+			g.handleDeviceKey(ev)
 			return
 		}
 		// With /dev/input driving movement, the duplicate keystrokes the
@@ -435,6 +470,12 @@ func (g *Game) handleKey(ev Event) {
 		g.move.release(dirFor(ev.Rune, ev.Key))
 		return
 	}
+	// True-state inputs report auto-repeat explicitly. Repeats keep movement and
+	// directional menus responsive, but action keys must remain edge-triggered:
+	// a repeated ESC used to resume and immediately pause again.
+	if ev.KeyAct == KeyRepeat && dirFor(ev.Rune, ev.Key) < 0 {
+		return
+	}
 	if ev.Key == KeyCtrlC {
 		g.state = StateQuit
 		return
@@ -453,6 +494,22 @@ func (g *Game) handleKey(ev Event) {
 				g.log("특성 획득: "+g.perkChoices[i].Name, 213)
 				g.perkChoices = nil
 				g.state = StatePlaying
+			}
+		}
+		return
+	case StateWeaponCore:
+		if r >= '1' && r <= '9' {
+			i := int(r - '1')
+			if i < len(g.coreChoices) {
+				core := g.coreChoices[i]
+				g.player.cores[g.coreWeapon] |= core
+				g.log(weapons[g.coreWeapon].Name+" 진화: "+core.Name(), 51)
+				g.coreChoices = nil
+				if len(g.perkChoices) > 0 {
+					g.state = StateLevelUp
+				} else {
+					g.state = StatePlaying
+				}
 			}
 		}
 		return
@@ -482,15 +539,17 @@ func (g *Game) handleKey(ev Event) {
 			g.state = g.menuReturn
 		}
 		return
-	case StateDead:
+	case StateDead, StateVictory:
 		if r == 'r' {
 			zoom := g.zoom // a restart should not undo the player's view setting
 			autoPause, showSeed := g.autoPause, g.showSeed
 			autoWeapon, screenShake := g.autoWeapon, g.screenShake
+			debugPerf := g.debugPerf
 			*g = *newGameWithInput(g.rng.Int63(), g.inputMode)
 			g.zoom = zoom
 			g.autoPause, g.showSeed = autoPause, showSeed
 			g.autoWeapon, g.screenShake = autoWeapon, screenShake
+			g.debugPerf = debugPerf
 		} else if r == 'q' || ev.Key == KeyEscape {
 			g.state = StateQuit
 		}
@@ -516,17 +575,37 @@ func (g *Game) handleKey(ev Event) {
 	case ev.Key == KeyTab || r == 'm':
 		g.showMap = !g.showMap
 	case ev.Key == KeySpace:
-		g.startDash()
+		if g.state == StatePlaying {
+			g.startDash()
+		}
+	case r == 'f':
+		if g.state == StatePlaying {
+			g.quickMeleeBuf = quickMeleeBufferTime
+		}
+	case r == '[':
+		if g.state == StatePlaying {
+			g.cycleWeapon(-1)
+		}
+	case r == ']':
+		if g.state == StatePlaying {
+			g.cycleWeapon(1)
+		}
 	case r == 'e':
-		g.tryStairs()
+		if g.state == StatePlaying {
+			g.tryStairs()
+		}
 	case r >= '1' && r <= '6':
-		g.selectWeapon(int(r - '1'))
+		if g.state == StatePlaying {
+			g.selectWeapon(int(r - '1'))
+		}
 	default:
-		g.move.press(dirFor(r, ev.Key), g.elapsed, ev.KeyAct == KeyRepeat)
+		if g.state == StatePlaying {
+			g.move.press(dirFor(r, ev.Key), g.elapsed, ev.KeyAct == KeyRepeat)
+		}
 	}
 }
 
-const settingsCount = 5
+const settingsCount = 6
 
 func (g *Game) adjustSetting(direction int) {
 	on := direction > 0
@@ -541,6 +620,9 @@ func (g *Game) adjustSetting(direction int) {
 		g.screenShake = on
 	case 4:
 		g.setZoom(g.zoom + direction)
+	case 5:
+		g.debugPerf = on
+		g.perf = perfStats{}
 	}
 }
 
@@ -576,6 +658,28 @@ func (g *Game) selectWeapon(i int) {
 	}
 }
 
+// cycleWeapon walks only through weapons that can fire right now. A wheel
+// tick should never strand the player on an empty or undiscovered slot.
+func (g *Game) cycleWeapon(direction int) {
+	if direction == 0 {
+		return
+	}
+	p := &g.player
+	step := 1
+	if direction < 0 {
+		step = -1
+	}
+	for n, i := 0, p.weapon; n < len(weapons); n++ {
+		i = (i + step + len(weapons)) % len(weapons)
+		if !p.owned[i] || (weapons[i].needsAmmo() && p.ammo[i] <= 0) {
+			continue
+		}
+		p.weapon = i
+		g.log(fmt.Sprintf("무기: %s ([%d])", weapons[i].Name, i+1), weapons[i].Color)
+		return
+	}
+}
+
 func (g *Game) pressMove(r rune, k Key) {
 	g.move.press(dirFor(r, k), g.elapsed, false)
 }
@@ -583,6 +687,14 @@ func (g *Game) pressMove(r rune, k Key) {
 func (g *Game) handleMouse(ev Event) {
 	g.mouseSet = true
 	g.aim = g.screenToWorld(ev.MX, ev.MY)
+	if g.state != StatePlaying {
+		// A click made while an overlay is open must not become a shot after
+		// returning to play. Releases still clear a button held beforehand.
+		if ev.Action == MouseRelease || (ev.Action == MouseMove && ev.Button == BtnNone) {
+			g.firing = false
+		}
+		return
+	}
 	switch ev.Action {
 	case MousePress:
 		if ev.Button == BtnLeft {
@@ -590,9 +702,17 @@ func (g *Game) handleMouse(ev Event) {
 			g.fireBuf = fireBufferTime
 		} else if ev.Button == BtnRight {
 			g.startDash()
+		} else if ev.Button == BtnMiddle {
+			g.quickMeleeBuf = quickMeleeBufferTime
+		} else if ev.Button == BtnWheelUp {
+			g.cycleWeapon(-1)
+		} else if ev.Button == BtnWheelDown {
+			g.cycleWeapon(1)
 		}
 	case MouseRelease:
-		g.firing = false
+		if ev.Button == BtnLeft {
+			g.firing = false
+		}
 	case MouseMove:
 		// Button bits are still reported while dragging; keep firing.
 		if ev.Button == BtnNone {
@@ -606,7 +726,7 @@ func (g *Game) startDash() {
 	if g.state != StatePlaying {
 		return
 	}
-	if p.dashCD > 0 {
+	if p.dashTimer > 0 || p.dashRecovery > 0 || p.dashEnergy+1e-9 < dashEnergyCost {
 		// Too early: queue it instead of dropping it on the floor.
 		p.dashBuffer = dashBufferTime
 		return
@@ -618,16 +738,47 @@ func (g *Game) startDash() {
 	if dir.len() < 0.01 {
 		return
 	}
-	p.dashDir = dir.norm()
-	p.dashTimer = 0.16
-	p.dashCD = p.dashMax
-	p.invuln = math.Max(p.invuln, 0.22)
+	nextDir := dir.norm()
+	gap := g.elapsed - p.lastDashEnd
+	continuity := 0.0
+	if p.dashMomentum > 0 && gap < dashMomentumFadeGap {
+		p.dashMomentum = min(p.dashMomentum+1, 3)
+		continuity = 1 - clampF((gap-dashMomentumFullGap)/
+			(dashMomentumFadeGap-dashMomentumFullGap), 0, 1)
+	} else {
+		p.dashMomentum = 1
+	}
+	speedMul := 1 + dashMomentumStep*float64(p.dashMomentum-1)*continuity
+	distance := dashDistance + dashDistanceStep*float64(p.dashMomentum-1)*continuity
+	straightBonus := 0.0
+	if p.dashMomentum == 2 {
+		straightBonus = dashStraightBonus2
+	} else if p.dashMomentum >= 3 {
+		straightBonus = dashStraightBonus3
+	}
+	distance += straightBonus * dashStraightness(p.dashDir, nextDir) * continuity
+	p.dashSpeed = (dashDistance / dashDuration) * speedMul
+	duration := distance / p.dashSpeed
+	p.dashDir = nextDir
+	p.dashTimer = duration
+	p.dashStepDistance = distance
+	p.dashEnergy -= dashEnergyCost
+	p.dashRegenWait = dashRegenDelay
+	p.invuln = math.Max(p.invuln, duration)
 	// The blink is also a shoulder charge: reset its hit list and the
-	// perfect-dodge flag so each dash gets exactly one of each.
+	// perfect-dodge chain so repeated taps cannot print rewards in bulk.
 	p.lastDashStart = g.elapsed
-	p.dodgedThisDash = false
+	if p.dashChainTimer <= 0 {
+		p.dodgedThisChain = false
+	}
+	p.dashChainTimer = dashChainWindow
 	p.dashHitIDs = p.dashHitIDs[:0]
 	g.spawnParticles(p.pos, 6, 0.25, 51, '.')
+}
+
+func dashStraightness(previous, next Vec) float64 {
+	dot := clampF(previous.X*next.X+previous.Y*next.Y, 0, 1)
+	return dot * dot
 }
 
 func (g *Game) moveDir() Vec { return g.move.dir(g.elapsed) }
@@ -660,9 +811,14 @@ func (g *Game) dashStrike() {
 		if already {
 			continue
 		}
+		if g.elapsed-e.lastDashHit < dashRepeatHitCD {
+			continue
+		}
 		p.dashHitIDs = append(p.dashHitIDs, e.id)
+		e.lastDashHit = g.elapsed
+		e.lastHitWeapon = wpMelee
 		dmg := dashStrikeDamage * p.damageMul * p.meleeMul
-		g.hurtEnemy(e, dmg, p.dashDir.visual().Scale(dashStrikeKnock))
+		g.hurtEnemyFrom(e, dmg, p.dashDir.visual().Scale(dashStrikeKnock), damageSecondary)
 		g.spawnParticles(e.pos, 6, 0.25, 51, '/')
 		g.shake = math.Max(g.shake, 0.10)
 	}
@@ -691,6 +847,12 @@ func (g *Game) tryStairs() {
 		mul := g.descentMul()
 		bonus := int(float64(50*g.depth) * mul)
 		g.score += bonus
+		if g.depth >= campaignDepth {
+			g.state = StateVictory
+			g.log("심층 코어를 돌파했다. 지상으로 귀환한다.", 226)
+			g.flash = 0.35
+			return
+		}
 		g.enterDepth(g.depth + 1)
 		g.log(fmt.Sprintf("B%d층으로 내려간다. (보너스 %d, 배율 x%.2f)", g.depth, bonus, mul), 117)
 		g.flash = 0.25
@@ -715,74 +877,130 @@ func (g *Game) Update(dt float64) {
 	}
 	g.elapsed += dt
 	p := &g.player
+	p.lifestealBudget = math.Min(p.lifestealCapPerSecond(),
+		p.lifestealBudget+p.lifestealCapPerSecond()*dt)
 
-	// --- player movement: impulse + friction -------------------------------
+	// --- player movement: intent-driven steering ----------------------------
+	// A buffered chain starts at a frame boundary, before movement and
+	// invulnerability are aged. Starting it at the tail of the previous frame
+	// made the protection expire before the body actually moved.
+	if p.dashBuffer > 0 && p.dashTimer <= 0 && p.dashRecovery <= 0 &&
+		p.dashEnergy+1e-9 >= dashEnergyCost {
+		p.dashBuffer = 0
+		g.startDash()
+	}
 	dir := g.moveDir()
-	accel := p.baseSpeed() * 9
-	friction := 9.0
-	if p.dashTimer > 0 {
-		p.dashTimer -= dt
-		// Steering: keys held during the dash bend it towards themselves, at a
-		// rate limit. The lock direction stays authoritative — this corrects a
-		// blink mid-flight rather than replacing aiming before it.
-		if in := g.moveDir(); in.len() > 0.01 {
-			cur := math.Atan2(p.dashDir.Y, p.dashDir.X)
-			want := math.Atan2(in.Y, in.X)
-			da := want - cur
-			if da > math.Pi {
-				da -= math.Pi * 2
-			} else if da < -math.Pi {
-				da += math.Pi * 2 // shortest way round the circle
-			}
-			maxTurn := dashSteerRate * dt
-			da = clampF(da, -maxTurn, maxTurn)
-			p.dashDir = Vec{math.Cos(cur + da), math.Sin(cur + da)}
+	dashing := p.dashTimer > 0
+	coasting := !dashing && p.dashCoast > 0
+	if coasting && dir.len() > 0.01 {
+		in := dir.norm()
+		if p.dashDir.X*in.X+p.dashDir.Y*in.Y < -0.2 {
+			// An explicit reversal means the player wanted one precise dash, not
+			// a slide that keeps carrying them past their intended stopping point.
+			p.dashCoast = 0
+			p.vel = Vec{}
+			coasting = false
 		}
-		p.vel = p.dashDir.Scale(p.baseSpeed() * 3.4 * p.dashPower)
+	}
+	coastMoveDT := math.Min(dt, p.dashCoast)
+	coastPhase0 := clampF(p.dashCoast/dashCoastDuration, 0, 1)
+	coastPhase1 := clampF((p.dashCoast-coastMoveDT)/dashCoastDuration, 0, 1)
+	moveDT := dt
+	if p.dashRecovery > 0 {
+		p.dashRecovery = math.Max(0, p.dashRecovery-dt)
+	}
+	if p.dashCoast > 0 {
+		p.dashCoast = math.Max(0, p.dashCoast-dt)
+	}
+	if p.dashChainTimer > 0 {
+		p.dashChainTimer -= dt
+		if p.dashChainTimer <= 0 {
+			p.dodgedThisChain = false
+		}
+	}
+	if p.dashRegenWait > 0 {
+		p.dashRegenWait -= dt
+	} else {
+		p.dashEnergy = math.Min(p.dashEnergyMax, p.dashEnergy+p.dashRegenPerSecond()*dt)
+	}
+	if dashing {
+		moveDT = math.Min(dt, p.dashTimer)
+		p.dashTimer -= dt
+		if p.dashTimer <= 0 {
+			p.dashTimer = 0
+			p.dashRecovery = math.Max(p.dashRecovery, math.Max(0, dashRecovery-(dt-moveDT)))
+			p.dashCoast = dashCoastDuration
+			p.lastDashEnd = g.elapsed - (dt - moveDT)
+		}
+		p.vel = p.dashDir.Scale(p.dashSpeed)
 		// Afterimage: a fading ghost of the player along the dash line, so the
 		// blink reads as movement rather than teleporting.
 		g.parts = append(g.parts, Particle{
 			pos: p.pos, life: 0.22, max: 0.22, glyph: '@', color: 45, hold: true,
 		})
+	} else if coasting {
+		// Integrate the quadratic falloff over this frame. Using the interval
+		// average keeps the coast distance stable through a 0.1s frame stall.
+		curve := (coastPhase0*coastPhase0 + coastPhase0*coastPhase1 +
+			coastPhase1*coastPhase1) / 3
+		coastSpeed := p.baseSpeed() * (1 + (dashCoastStartMul-1)*curve)
+		coastDir := p.dashDir
+		if dir.len() > 0.01 {
+			steer := 1 - (coastPhase0+coastPhase1)/2
+			coastDir = p.dashDir.Scale(1 - steer).Add(dir.norm().Scale(steer)).norm()
+		}
+		if g.inAcid(p.pos) {
+			coastSpeed *= acidSlow
+		}
+		moveDT = coastMoveDT
+		p.vel = coastDir.Scale(coastSpeed)
+		g.parts = append(g.parts, Particle{
+			pos: p.pos, life: 0.12, max: 0.12, glyph: '.', color: 37, hold: true,
+		})
 	} else {
-		p.vel = p.vel.Add(dir.Scale(accel * dt))
-		p.vel = p.vel.Scale(math.Max(0, 1-friction*dt))
 		top := p.baseSpeed()
 		if g.inAcid(p.pos) {
 			top *= acidSlow // wading, not walking
 		}
-		if s := p.vel.len(); s > top {
-			p.vel = p.vel.Scale(top / s)
-		}
+		target := dir.Scale(top)
+		p.vel = steerMovementVelocity(p.vel, target, dt)
 	}
-	if p.dashCD > 0 {
-		p.dashCD -= dt
-		// A dash pressed during the cooldown is remembered briefly, so a
-		// slightly early Space still fires the instant the gauge refills.
-		if p.dashBuffer > 0 {
-			p.dashBuffer -= dt
-			if p.dashBuffer <= 0 || p.dashCD <= 0 {
-				p.dashBuffer = 0
-				if p.dashCD <= 0 {
-					g.startDash()
-				}
-			}
+	if p.dashBuffer > 0 {
+		p.dashBuffer -= dt
+		if p.dashBuffer <= 0 {
+			p.dashBuffer = 0
 		}
-	} else if p.dashBuffer > 0 {
-		p.dashBuffer = 0
-		g.startDash()
 	}
 	if p.invuln > 0 {
 		p.invuln -= dt
 	}
-	g.moveWithCollision(&p.pos, p.vel.unvisual().Scale(dt), p.radius)
-	if p.dashTimer > 0 {
+	g.moveWithCollision(&p.pos, p.vel.unvisual().Scale(moveDT), p.radius)
+	if dashing {
 		g.dashStrike()
+		if p.dashTimer <= 0 {
+			p.vel = p.dashDir.Scale(p.baseSpeed() * dashCoastStartMul)
+		}
+	} else if coasting && p.dashCoast <= 0 {
+		p.vel = p.dashDir.Scale(p.baseSpeed())
 	}
 
 	// --- shooting -----------------------------------------------------------
 	if p.cooldown > 0 {
 		p.cooldown -= dt
+	}
+	// Quick melee borrows the shared attack cooldown but never changes the
+	// equipped weapon. It is a defensive cancel, not another inventory chore.
+	if g.quickMeleeBuf > 0 && p.cooldown <= 0 {
+		g.quickMeleeBuf = 0
+		dir := g.moveDir()
+		if g.mouseSet {
+			dir = aimDir(p.pos, g.aim)
+		}
+		if dir.len() < 0.01 {
+			dir = Vec{X: 1}
+		}
+		g.meleeSwing(p.pos, dir)
+		p.cooldown = weapons[wpMelee].Cooldown / p.fireMul
 	}
 	// A trigger tap that lands during the cooldown is buffered the same way as
 	// dash, so a deliberate single click is never swallowed by a bad frame.
@@ -795,6 +1013,12 @@ func (g *Game) Update(dt float64) {
 	}
 	if g.fireBuf > 0 {
 		g.fireBuf -= dt
+	}
+	if g.quickMeleeBuf > 0 {
+		g.quickMeleeBuf -= dt
+		if g.quickMeleeBuf < 0 {
+			g.quickMeleeBuf = 0
+		}
 	}
 
 	// --- visibility & pathing ----------------------------------------------
@@ -828,6 +1052,7 @@ func (g *Game) Update(dt float64) {
 	g.updateHazards(dt)
 	g.updateAmbush(dt)
 	g.updatePressure(dt)
+	g.updateObjectiveHint(dt)
 
 	if g.shake > 0 {
 		g.shake -= dt
@@ -1026,6 +1251,9 @@ func (g *Game) updateBullets(dt float64) {
 			b.pos = b.pos.Add(b.vel.Scale(dt / float64(steps)))
 			if g.level.SolidAtPoint(b.pos) {
 				if b.explode {
+					if b.friendly {
+						g.markBlastSource(b.pos, 4.5, b.weapon)
+					}
 					g.explode(b.pos, 4.5, b.dmg, b.friendly)
 				} else {
 					g.spawnParticles(b.pos, 2, 0.12, 240, '.')
@@ -1037,6 +1265,9 @@ func (g *Game) updateBullets(dt float64) {
 			// blow up the room too.
 			if bar := g.barrelAt(b.pos, 0.25); bar != nil {
 				if b.explode {
+					if b.friendly {
+						g.markBlastSource(b.pos, 4.5, b.weapon)
+					}
 					g.explode(b.pos, 4.5, b.dmg, b.friendly)
 				} else {
 					g.hurtBarrel(bar, b.dmg)
@@ -1080,9 +1311,11 @@ func (g *Game) bulletVsEnemies(b *Bullet) bool {
 			continue
 		}
 		if b.explode {
+			g.markBlastSource(b.pos, 4.5, b.weapon)
 			g.explode(b.pos, 4.5, b.dmg, true)
 			return true
 		}
+		e.lastHitWeapon = b.weapon
 		g.hurtEnemy(e, b.dmg, b.vel.visual().norm().Scale(b.knock))
 		b.hitIDs = append(b.hitIDs, e.id)
 		if b.pierce > 0 {
@@ -1095,7 +1328,20 @@ func (g *Game) bulletVsEnemies(b *Bullet) bool {
 	return false
 }
 
+type enemyDamageSource uint8
+
+const (
+	damageSecondary enemyDamageSource = iota
+	damageWeapon
+)
+
+// hurtEnemy is the direct weapon-hit path. Secondary effects must opt out of
+// lifesteal through hurtEnemyFrom so damage chains cannot become healing loops.
 func (g *Game) hurtEnemy(e *Enemy, dmg float64, knock Vec) {
+	g.hurtEnemyFrom(e, dmg, knock, damageWeapon)
+}
+
+func (g *Game) hurtEnemyFrom(e *Enemy, dmg float64, knock Vec, source enemyDamageSource) {
 	// A live shield soaks the hit first and only the remainder reaches the
 	// body. Absorbing in fractions (rather than voiding whole hits) keeps
 	// shotguns and the railgun honest against it: big numbers still punch
@@ -1131,11 +1377,17 @@ func (g *Game) hurtEnemy(e *Enemy, dmg float64, knock Vec) {
 		col = colStairs // the killing blow pays off in the exit colour
 	}
 	g.addFloater(Vec{
-		e.pos.X + g.rng.Float64()*0.8 - 0.4,
-		e.pos.Y - 0.3 - g.rng.Float64()*0.4,
+		e.pos.X + g.fxRNG.Float64()*0.8 - 0.4,
+		e.pos.Y - 0.3 - g.fxRNG.Float64()*0.4,
 	}, strconv.Itoa(int(dmg+0.5)), col)
-	if g.player.lifesteal > 0 {
-		g.heal(landed * g.player.lifesteal)
+	if source == damageWeapon && g.player.lifesteal > 0 && landed > 0 {
+		requested := landed * g.player.lifesteal
+		healed := math.Min(requested, g.player.lifestealBudget)
+		healed = math.Min(healed, math.Max(0, g.player.maxHP-g.player.hp))
+		if healed > 0 {
+			g.player.lifestealBudget -= healed
+			g.heal(healed)
+		}
 	}
 	g.eliteOnHurt(e)
 }
@@ -1171,9 +1423,13 @@ func (g *Game) reapEnemies() {
 			g.hitStop = math.Max(g.hitStop, killSlowmo)
 		}
 		g.eliteOnDeath(&e)
+		g.triggerRupture(e.lastHitWeapon, e.pos)
 		if e.def.Behavior == BeBoss {
 			g.log(fmt.Sprintf("%s 격파! 계단이 열렸다.", e.def.Name), 226)
 			g.addPickup(Pickup{pos: e.pos, kind: PickHeart})
+			if g.depth%floorsPerAct == 0 && g.depth < campaignDepth {
+				g.offerWeaponCores(e.lastHitWeapon)
+			}
 		} else if e.elite != EliteNone {
 			g.log(fmt.Sprintf("%s 처치!", e.def.Name), e.def.Color)
 			g.addPickup(Pickup{pos: e.pos, kind: PickAmmo, weapon: g.rollAmmoFor()})
@@ -1242,7 +1498,11 @@ func (g *Game) explode(at Vec, radius, dmg float64, friendly bool) {
 		d := vdist(at, e.pos)
 		if d < radius {
 			f := 1 - d/radius
-			g.hurtEnemy(e, dmg*f, e.pos.Sub(at).visual().norm().Scale(4))
+			source := damageSecondary
+			if friendly {
+				source = damageWeapon
+			}
+			g.hurtEnemyFrom(e, dmg*f, e.pos.Sub(at).visual().norm().Scale(4), source)
 		}
 	}
 	// Rockets and bomber blasts both hurt the player.
@@ -1298,13 +1558,13 @@ func (g *Game) damagePlayer(dmg float64, dir Vec) {
 	if p.invuln > 0 || g.state != StatePlaying {
 		// Perfect dodge: a hit that lands inside a young dash was beaten by
 		// the player's timing, not by the invulnerability they were owed, so
-		// it pays out — bullet time and most of the gauge back. Once per dash,
-		// or riding an explosion would print the reward in bulk.
+		// it pays out — bullet time and energy back. Once per chain, or rapidly
+		// tapping through an explosion would print the reward in bulk.
 		if g.state == StatePlaying &&
-			g.elapsed-p.lastDashStart <= perfectDodgeWindow && !p.dodgedThisDash {
-			p.dodgedThisDash = true
+			g.elapsed-p.lastDashStart <= perfectDodgeWindow && !p.dodgedThisChain {
+			p.dodgedThisChain = true
 			g.hitStop = math.Max(g.hitStop, perfectDodgeSlowmo)
-			p.dashCD = math.Min(p.dashCD, p.dashMax*perfectDodgeRefund)
+			p.dashEnergy = math.Min(p.dashEnergyMax, p.dashEnergy+perfectDodgeEnergy)
 			g.addFloater(p.pos.Add(Vec{0, -0.7}), "완벽 회피!", 51)
 			g.log("완벽 회피! 대시 게이지가 돌아왔다.", 51)
 		}
@@ -1394,9 +1654,9 @@ func (g *Game) updatePickups(dt float64) {
 
 func (g *Game) spawnParticles(at Vec, n int, life float64, color int16, glyph rune) {
 	for i := 0; i < n; i++ {
-		a := g.rng.Float64() * math.Pi * 2
-		sp := 2 + g.rng.Float64()*8
-		l := life * (0.5 + g.rng.Float64())
+		a := g.fxRNG.Float64() * math.Pi * 2
+		sp := 2 + g.fxRNG.Float64()*8
+		l := life * (0.5 + g.fxRNG.Float64())
 		g.parts = append(g.parts, Particle{
 			pos:   at,
 			vel:   Vec{1, 0}.rotate(a).unvisual().Scale(sp),
@@ -1443,15 +1703,18 @@ var allPerks = []Perk{
 	{"강화 골격", "최대 체력 +20, 즉시 회복", func(p *Player) { p.maxHP += 20; p.hp += 20 }},
 	{"관통탄", "총알이 적 1명을 더 관통", func(p *Player) { p.pierce++ }},
 	{"이중 사격", "발사체 +1", func(p *Player) { p.extraShots++ }},
-	{"흡혈 회로", "준 피해의 4%를 회복", func(p *Player) { p.lifesteal += 0.04 }},
-	{"단축 회로", "대시 쿨다운 -30%", func(p *Player) { p.dashMax *= 0.7 }},
+	{"흡혈 회로", "준 피해의 2%를 회복 (회복 예산 적용)", func(p *Player) { p.lifesteal += 0.02 }},
+	{"단축 회로", "대시 에너지 충전 +30%", func(p *Player) { p.dashRegenMul *= 1.3 }},
 	// Deliberately not a heal. Survivability perks that hand back health make
 	// health stop being the resource a run is played against; this one makes
 	// the health you have last longer instead of replacing it.
 	{"방탄 조끼", "받는 피해 -12%", func(p *Player) { p.damageTaken *= 0.88 }},
 	// The dash-themed picks: they deepen the answer to "when do I blink"
 	// rather than adding a passive number.
-	{"제트 부스트", "대시 이동 거리 +30%", func(p *Player) { p.dashPower *= 1.3 }},
+	{"제트 부스트", "대시 에너지 최대치 +25", func(p *Player) {
+		p.dashEnergyMax += 25
+		p.dashEnergy = math.Min(p.dashEnergyMax, p.dashEnergy+25)
+	}},
 	{"강화 건틀릿", "근접과 대시 충격 피해 +40%", func(p *Player) { p.meleeMul *= 1.4 }},
 	{"자기장", "떨어진 아이템이 더 멀리서 끌려온다", func(p *Player) { p.magnetMul *= 1.6 }},
 }
@@ -1462,7 +1725,11 @@ func (g *Game) offerPerks() {
 	for i := 0; i < 3 && i < len(idx); i++ {
 		g.perkChoices = append(g.perkChoices, allPerks[idx[i]])
 	}
-	g.state = StateLevelUp
+	// A boss core is the rarer modal and stays on top. Its selection resumes
+	// this pending perk screen, even if another enemy died later in the frame.
+	if g.state != StateWeaponCore {
+		g.state = StateLevelUp
+	}
 	g.log(fmt.Sprintf("레벨 %d 달성!", g.player.level), 213)
 }
 

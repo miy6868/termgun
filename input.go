@@ -36,10 +36,12 @@ const (
 )
 
 const (
-	BtnLeft   = 0
-	BtnMiddle = 1
-	BtnRight  = 2
-	BtnNone   = 3
+	BtnLeft      = 0
+	BtnMiddle    = 1
+	BtnRight     = 2
+	BtnNone      = 3
+	BtnWheelUp   = 4
+	BtnWheelDown = 5
 )
 
 // Key codes for keys that arrive as escape sequences. Printable keys are
@@ -272,9 +274,15 @@ func parseSGRMouse(b []byte) (ev Event, used int, ok bool) {
 		ev.Action = MousePress
 		ev.Button = code & 3
 	}
-	// Wheel events (codes 64/65) arrive as presses; report them as button 3.
+	// Wheel events are edge-triggered presses. Keeping their direction turns the
+	// wheel into a natural weapon selector instead of silently discarding it.
 	if code&64 != 0 {
-		ev.Button = BtnNone
+		ev.Action = MousePress
+		if code&1 == 0 {
+			ev.Button = BtnWheelUp
+		} else {
+			ev.Button = BtnWheelDown
+		}
 	}
 	return ev, end + 1, true
 }

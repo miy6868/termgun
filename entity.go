@@ -1,5 +1,7 @@
 package main
 
+import "math"
+
 type Player struct {
 	pos      Vec
 	vel      Vec
@@ -12,17 +14,28 @@ type Player struct {
 	cooldown float64
 
 	// dash
-	dashCD    float64
-	dashTimer float64
-	dashDir   Vec
-	// dashBuffer holds a Space press that landed mid-cooldown; it fires the
-	// moment the dash is ready instead of eating the input.
+	dashEnergy       float64
+	dashEnergyMax    float64
+	dashRegenMul     float64
+	dashRegenWait    float64
+	dashRecovery     float64
+	dashTimer        float64
+	dashDir          Vec
+	dashSpeed        float64
+	dashStepDistance float64
+	dashCoast        float64
+	dashMomentum     int
+	lastDashEnd      float64
+	// dashBuffer holds a Space press that landed during a live dash or its
+	// recovery; it fires as soon as the next short step is legal.
 	dashBuffer float64
 	// lastDashStart is when the live dash began, so a hit landing just inside
 	// it can be graded as a perfect dodge rather than plain invulnerability.
 	lastDashStart float64
-	// dodgedThisDash keeps the perfect-dodge reward to once per dash.
-	dodgedThisDash bool
+	// A chain lasts briefly across repeated short dashes. Perfect-dodge energy
+	// pays once per chain, not once per button press.
+	dashChainTimer  float64
+	dodgedThisChain bool
 	// dashHitIDs lists enemies already struck by the current dash, so one
 	// blink deals its impact damage to each body at most once.
 	dashHitIDs []int
@@ -36,14 +49,18 @@ type Player struct {
 	pierce     int
 	extraShots int
 	lifesteal  float64
-	dashMax    float64
-	// dashPower stretches the blink itself; magnetMul widens loot pull;
-	// meleeMul drives both the melee arc and the dash impact.
-	dashPower float64
+	// lifestealBudget is a token bucket measured in HP. Its capacity and
+	// refill rate grow with level and maximum health, preventing burst weapons
+	// from bypassing the per-second sustain budget.
+	lifestealBudget float64
+	// magnetMul widens loot pull; meleeMul drives both the melee arc and the
+	// dash impact.
 	magnetMul float64
 	meleeMul  float64
 	// damageTaken scales incoming damage; shrines can trade it away
 	damageTaken float64
+	cores       []WeaponCore // one bitset per weapon
+	coreShots   []int        // trigger count for cadence-based cores
 
 	level  int
 	xp     int
@@ -56,15 +73,33 @@ func newPlayer() Player {
 	owned[wpMelee] = true // the fallback attack is always available
 	ammo := make([]int, len(weapons))
 	ammo[wpPistol] = startingAmmo
-	return Player{
+	cores := make([]WeaponCore, len(weapons))
+	coreShots := make([]int, len(weapons))
+	p := Player{
 		hp: 100, maxHP: 100, radius: 0.42,
 		weapon:    wpPistol,
 		owned:     owned,
 		ammo:      ammo,
+		cores:     cores,
+		coreShots: coreShots,
 		damageMul: 1, fireMul: 1, speedMul: 1, damageTaken: 1,
-		dashMax: 1.6, dashPower: 1, magnetMul: 1, meleeMul: 1,
+		dashEnergy: dashEnergyBase, dashEnergyMax: dashEnergyBase, dashRegenMul: 1,
+		magnetMul: 1, meleeMul: 1,
 		level: 1, xpNext: 12,
 	}
+	p.lifestealBudget = p.lifestealCapPerSecond()
+	return p
+}
+
+func (p *Player) lifestealCapPerSecond() float64 {
+	ratio := math.Min(0.025+0.00075*float64(max(0, p.level-1)), 0.05)
+	return p.maxHP * ratio
+}
+
+func (p *Player) dashRegenPerSecond() float64 {
+	hpFrac := clampF(p.hp/p.maxHP, 0, 1)
+	crisis := clampF((0.30-hpFrac)/0.30, 0, 1)
+	return dashRegenBase * p.dashRegenMul * (1 + 1.5*crisis*crisis*crisis)
 }
 
 // totalAmmo is every round the player is carrying, across all weapons.
@@ -92,6 +127,7 @@ type Bullet struct {
 	knock    float64
 	explode  bool
 	friendly bool
+	weapon   int // player weapon that created it; ignored for hostile bullets
 	hitIDs   []int
 }
 

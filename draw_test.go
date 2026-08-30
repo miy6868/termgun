@@ -77,7 +77,7 @@ func TestNothingIsDrawnInsideAWall(t *testing.T) {
 
 			for frame := 0; frame < 60*250 && g.depth < 5; frame++ {
 				switch g.state {
-				case StateLevelUp:
+				case StateLevelUp, StateWeaponCore:
 					g.handleKey(Event{Kind: EvKey, Rune: '1'})
 					continue
 				case StateDead:

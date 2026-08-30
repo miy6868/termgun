@@ -52,6 +52,9 @@ func TestSettingsToggleAndSurviveRestart(t *testing.T) {
 	if !g.autoPause || !g.showSeed || !g.autoWeapon || !g.screenShake {
 		t.Fatal("settings should default on")
 	}
+	if g.debugPerf {
+		t.Fatal("performance debugging should default off")
+	}
 
 	g.handleKey(Event{Kind: EvKey, Rune: '0'})
 	if g.state == StateSettings {
@@ -63,7 +66,7 @@ func TestSettingsToggleAndSurviveRestart(t *testing.T) {
 	}
 	g.Draw(s)
 	text := overlayText(s)
-	for _, want := range []string{"> 포커스", "자동 일시 정지", "현재 시드 표시", "자동 무기 변경", "화면 흔들림", "화면 배율", "^/v", "<-/->"} {
+	for _, want := range []string{"> 포커스", "자동 일시 정지", "현재 시드 표시", "자동 무기 변경", "화면 흔들림", "화면 배율", "성능 디버깅 정보", "^/v", "<-/->"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("settings page does not show %q", want)
 		}
@@ -83,19 +86,35 @@ func TestSettingsToggleAndSurviveRestart(t *testing.T) {
 		g.handleKey(Event{Kind: EvKey, Key: KeyDown})
 	}
 	g.handleKey(Event{Kind: EvKey, Key: KeyRight})
+	g.handleKey(Event{Kind: EvKey, Key: KeyDown})
+	g.handleKey(Event{Kind: EvKey, Key: KeyRight})
 	g.handleKey(Event{Kind: EvKey, Rune: 'o'})
 	if g.autoPause || g.showSeed || g.autoWeapon || g.screenShake {
 		t.Fatal("settings toggles did not turn off")
 	}
+	if !g.debugPerf {
+		t.Fatal("performance debugging did not turn on")
+	}
 	if g.zoom != startZoom+1 {
 		t.Fatalf("settings zoom is x%d, want x%d", g.zoom, startZoom+1)
+	}
+	g.perf.fps, g.perf.frameMS, g.perf.peakMS = 60, 16.67, 18.2
+	g.perf.updateMS, g.perf.drawMS, g.perf.outputMS = 0.1, 0.2, 0.3
+	g.Draw(s)
+	text = overlayText(s)
+	for _, want := range []string{"FPS", "FRAME", "UPD", "DRAW", "HEAP", "GC", "OBJ"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("performance overlay does not show %q", want)
+		}
 	}
 
 	g.state = StateDead
 	g.handleKey(Event{Kind: EvKey, Rune: 'r'})
-	if g.state != StatePlaying || g.autoPause || g.showSeed || g.autoWeapon || g.screenShake || g.zoom != startZoom+1 {
-		t.Fatalf("restart lost settings: state=%v autoPause=%v showSeed=%v autoWeapon=%v screenShake=%v zoom=%d",
-			g.state, g.autoPause, g.showSeed, g.autoWeapon, g.screenShake, g.zoom)
+	if g.state != StatePlaying || g.autoPause || g.showSeed || g.autoWeapon || g.screenShake ||
+		!g.debugPerf || g.zoom != startZoom+1 {
+		t.Fatalf("restart lost settings: state=%v autoPause=%v showSeed=%v autoWeapon=%v "+
+			"screenShake=%v debugPerf=%v zoom=%d", g.state, g.autoPause, g.showSeed,
+			g.autoWeapon, g.screenShake, g.debugPerf, g.zoom)
 	}
 }
 
@@ -134,6 +153,28 @@ func TestFocusAutoPauseCanBeDisabled(t *testing.T) {
 	}
 }
 
+func TestPauseToggleIgnoresKeyRepeat(t *testing.T) {
+	g := newGameWithInput(85, InputKitty)
+	g.state = StatePaused
+	g.handleKey(Event{Kind: EvKey, Key: KeyEscape, KeyAct: KeyPress})
+	if g.state != StatePlaying {
+		t.Fatalf("ESC press left state %v, want playing", g.state)
+	}
+	g.handleKey(Event{Kind: EvKey, Key: KeyEscape, KeyAct: KeyRepeat})
+	if g.state != StatePlaying {
+		t.Fatalf("ESC repeat toggled state back to %v", g.state)
+	}
+
+	g.handleKey(Event{Kind: EvKey, Rune: 'p', KeyAct: KeyPress})
+	if g.state != StatePaused {
+		t.Fatalf("P press left state %v, want paused", g.state)
+	}
+	g.handleKey(Event{Kind: EvKey, Rune: 'p', KeyAct: KeyRepeat})
+	if g.state != StatePaused {
+		t.Fatalf("P repeat toggled state back to %v", g.state)
+	}
+}
+
 func TestGameOverSeedVisibility(t *testing.T) {
 	const seed = int64(424242)
 	s := newTestScreen(60, 20)
@@ -167,5 +208,74 @@ func TestDeviceInputLetsSettingsUseArrowKeys(t *testing.T) {
 	g.HandleEvent(Event{Kind: EvKey, Key: KeyDown, Src: SrcTTY})
 	if g.settingRow != 1 {
 		t.Fatalf("terminal down key focused row %d in device mode, want 1", g.settingRow)
+	}
+}
+
+func TestDeviceReleaseInMenuDoesNotLeaveMovementStuck(t *testing.T) {
+	g := newGameWithInput(93, InputDevice)
+	g.HandleEvent(Event{Kind: EvKey, Src: SrcDevice, Dir: dirRight, KeyAct: KeyPress})
+	if g.moveDir().X <= 0 {
+		t.Fatal("device key did not start movement")
+	}
+	g.HandleEvent(Event{Kind: EvKey, Src: SrcTTY, Rune: 'o'})
+	g.HandleEvent(Event{Kind: EvKey, Src: SrcDevice, Dir: dirRight, KeyAct: KeyRelease})
+	g.HandleEvent(Event{Kind: EvKey, Src: SrcTTY, Rune: 'o'})
+	if d := g.moveDir(); d.len() != 0 {
+		t.Fatalf("device release inside settings left movement stuck at %v", d)
+	}
+}
+
+func TestModalMovementPressDoesNotArmPlayer(t *testing.T) {
+	states := []struct {
+		name  string
+		state State
+	}{
+		{"paused", StatePaused},
+		{"level-up", StateLevelUp},
+		{"weapon-core", StateWeaponCore},
+		{"help", StateHelp},
+		{"settings", StateSettings},
+		{"dead", StateDead},
+		{"victory", StateVictory},
+	}
+	inputs := []struct {
+		name  string
+		mode  InputMode
+		event Event
+	}{
+		{"terminal", InputKitty, Event{Kind: EvKey, Src: SrcTTY, Rune: 'd', KeyAct: KeyPress}},
+		{"device", InputDevice, Event{Kind: EvKey, Src: SrcDevice, Dir: dirRight, KeyAct: KeyPress}},
+	}
+
+	for _, input := range inputs {
+		for _, state := range states {
+			t.Run(input.name+"/"+state.name, func(t *testing.T) {
+				g := newGameWithInput(95, input.mode)
+				g.state = state.state
+				g.HandleEvent(input.event)
+				g.state = StatePlaying
+				if d := g.moveDir(); d.len() != 0 {
+					t.Fatalf("movement pressed in modal state %v remained armed at %v", state.state, d)
+				}
+			})
+		}
+	}
+}
+
+func TestPausedGameplayInputsDoNotChangeResumeState(t *testing.T) {
+	g := newGameWithInput(97, InputKitty)
+	g.player.owned[wpPistol] = true
+	g.player.ammo[wpPistol] = 10
+	g.player.weapon = wpMelee
+	g.state = StatePaused
+
+	g.HandleEvent(Event{Kind: EvKey, Src: SrcTTY, Rune: '1', KeyAct: KeyPress})
+	g.HandleEvent(Event{Kind: EvMouse, Action: MousePress, Button: BtnLeft})
+
+	if g.player.weapon != wpMelee {
+		t.Fatalf("paused weapon input selected weapon %d", g.player.weapon)
+	}
+	if g.firing || g.fireBuf > 0 {
+		t.Fatal("paused mouse press armed firing for resume")
 	}
 }

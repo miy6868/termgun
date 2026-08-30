@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -12,6 +13,15 @@ func camTest(t *testing.T, zoom, frames int, step func(g *Game, i int)) (shifts 
 	g := newGameWithInput(7, InputKitty)
 	g.zoom = zoom
 	g.enemies = g.enemies[:0]
+	// Camera cadence must not depend on which way a generated spawn room opens.
+	// Give this camera-only fixture a long, explicit runway across the map.
+	runwayY := g.level.H / 2
+	for x := 1; x < g.level.W-1; x++ {
+		g.level.tiles[g.level.idx(x, runwayY)] = TileFloor
+		g.level.tiles[g.level.idx(x, runwayY+1)] = TileFloor
+	}
+	g.level.invalidateTerrain()
+	g.player.pos = Vec{2.5, float64(runwayY) + 0.5}
 	s := newTestScreen(120, 40)
 	g.mouseSet = true
 	g.aim = g.player.pos.Add(Vec{8, 2})
@@ -107,6 +117,206 @@ func TestSustainedScrollIsEvenlyPaced(t *testing.T) {
 			t.Errorf("zoom x%d: scroll steps are %d-%d frames apart (%v); "+
 				"the pacing must be even", zoom, lo, hi, gaps)
 		}
+	}
+}
+
+func TestPlayerDoesNotJitterWhileCameraTracks(t *testing.T) {
+	for _, zoom := range []int{1, 2, 3, 4} {
+		for _, axis := range []string{"horizontal", "vertical"} {
+			g := newGameWithInput(17, InputKitty)
+			g.zoom = zoom
+			g.enemies = g.enemies[:0]
+			g.mouseSet = false
+			s := newTestScreen(60*zoom, 20*zoom+hudTop+hudBottom)
+			g.player.pos = Vec{float64(g.level.W) / 2, float64(g.level.H) / 2}
+			g.Draw(s)
+
+			lastCamX, lastCamY := g.camCell()
+			anchor, tracked := -1, 0
+			for i := 0; i < 160; i++ {
+				if axis == "horizontal" {
+					g.player.pos.X += 0.10
+				} else {
+					g.player.pos.Y += 0.10
+				}
+				g.Draw(s)
+				camX, camY := g.camCell()
+				if camX == lastCamX && camY == lastCamY {
+					continue
+				}
+				px, py := g.worldToScreen(g.player.pos)
+				position := px
+				if axis == "vertical" {
+					position = py
+				}
+				if anchor < 0 {
+					anchor = position
+				} else if position != anchor {
+					t.Fatalf("zoom x%d %s tracking jittered between screen cells %d and %d",
+						zoom, axis, anchor, position)
+				}
+				tracked++
+				lastCamX, lastCamY = camX, camY
+			}
+			if tracked < 4 {
+				t.Fatalf("zoom x%d %s fixture produced only %d tracked cells", zoom, axis, tracked)
+			}
+		}
+	}
+}
+
+func TestAddingDiagonalAxisKeepsTrackedPlayerAnchored(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		first, second int
+	}{
+		{"W then D", dirUp, dirRight},
+		{"D then W", dirRight, dirUp},
+		{"S then A", dirDown, dirLeft},
+		{"A then S", dirLeft, dirDown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGameWithInput(19, InputKitty)
+			rows := make([]string, 80)
+			for i := range rows {
+				rows[i] = strings.Repeat(".", 120)
+			}
+			g.level = testLevel(rows)
+			g.player.pos = Vec{60.5, 40.5}
+			g.enemies = g.enemies[:0]
+			g.mouseSet = false
+			g.zoom = 2
+			s := newTestScreen(60, 24)
+			g.Draw(s)
+			g.camX = g.player.pos.X - float64(g.tilesW)/2
+			g.camY = g.player.pos.Y - float64(g.tilesH)/2
+			g.Draw(s)
+
+			startCamX, startCamY := g.camCell()
+			g.move.press(tc.first, g.elapsed, false)
+			for i := 0; i < 90; i++ {
+				g.Update(1.0 / 60)
+				g.Draw(s)
+			}
+			beforeCamX, beforeCamY := g.camCell()
+			if beforeCamX == startCamX && beforeCamY == startCamY {
+				t.Fatal("fixture did not start camera tracking")
+			}
+			anchorX, anchorY := g.worldToScreen(g.player.pos)
+
+			// Once the first axis owns the camera, the second must join the same
+			// scroll instead of sending the player across another dead zone.
+			g.move.press(tc.second, g.elapsed, false)
+			for i := 0; i < 60; i++ {
+				g.Update(1.0 / 60)
+				g.Draw(s)
+				px, py := g.worldToScreen(g.player.pos)
+				if px != anchorX || py != anchorY {
+					t.Fatalf("staged diagonal moved the tracked player from (%d,%d) "+
+						"to (%d,%d) at frame %d", anchorX, anchorY, px, py, i)
+				}
+			}
+		})
+	}
+}
+
+// At a level edge the bounds clamp can leave the player outside the ordinary
+// camera dead zone. If a staged diagonal copied that edge position onto its new
+// axis, the camera followed the player while preserving an invalid anchor and
+// then snapped back to the level edge as soon as movement stopped.
+func TestAddingDiagonalAxisAtLevelEdgeDoesNotSnapOnStop(t *testing.T) {
+	g := newGameWithInput(21, InputKitty)
+	rows := make([]string, 80)
+	for i := range rows {
+		rows[i] = strings.Repeat(".", 120)
+	}
+	g.level = testLevel(rows)
+	g.player.pos = Vec{118.5, 40.5}
+	g.enemies = g.enemies[:0]
+	g.mouseSet = false
+	g.zoom = 2
+	s := newTestScreen(60, 24)
+	g.Draw(s)
+
+	// Start against the right edge, then make the vertical axis own the camera.
+	g.camX = float64(g.level.W - g.tilesW)
+	g.camY = g.player.pos.Y - float64(g.tilesH)/2
+	g.Draw(s)
+	g.move.press(dirDown, g.elapsed, false)
+	for i := 0; i < 30; i++ {
+		g.player.pos.Y += 0.1
+		g.Draw(s)
+	}
+	if g.camLockY == 0 {
+		t.Fatal("fixture did not start vertical camera tracking")
+	}
+
+	// Add movement away from the edge. That axis must cross back into the dead
+	// zone as player motion; dragging the camera with it stores a large correction
+	// which is otherwise applied in one frame when the keys are released.
+	g.move.press(dirLeft, g.elapsed, false)
+	for i := 0; i < 40; i++ {
+		g.player.pos.X -= 0.1
+		g.player.pos.Y += 0.1
+		g.Draw(s)
+	}
+	g.move.releaseAll()
+	beforeX, beforeY := g.camCell()
+	g.Draw(s)
+	afterX, afterY := g.camCell()
+	if afterX != beforeX || afterY != beforeY {
+		t.Fatalf("camera snapped on stop at the level edge: (%d,%d)->(%d,%d)",
+			beforeX, beforeY, afterX, afterY)
+	}
+}
+
+func TestCameraNeverJumpsDuringInputTransitions(t *testing.T) {
+	g := newGameWithInput(23, InputKitty)
+	rows := make([]string, 80)
+	for i := range rows {
+		rows[i] = strings.Repeat(".", 120)
+	}
+	g.level = testLevel(rows)
+	g.player.pos = Vec{60.5, 40.5}
+	g.enemies = g.enemies[:0]
+	g.mouseSet = false
+	g.zoom = 2
+	s := newTestScreen(60, 24)
+	g.Draw(s)
+	g.camX = g.player.pos.X - float64(g.tilesW)/2
+	g.camY = g.player.pos.Y - float64(g.tilesH)/2
+	g.Draw(s)
+
+	prevPlayerX := int(math.Floor(g.player.pos.X * float64(g.zoomEff)))
+	prevPlayerY := int(math.Floor(g.player.pos.Y * float64(g.zoomEff)))
+	prevCamX, prevCamY := g.camCell()
+	for frame := 0; frame < 1800; frame++ {
+		if frame%73 == 0 {
+			g.move.releaseAll()
+			first := (frame / 73) % numDirs
+			g.move.press(first, g.elapsed, false)
+			if frame%146 != 0 {
+				g.move.press((first+1)%numDirs, g.elapsed, false)
+			}
+		}
+		dt := 1.0 / 60
+		if frame%211 == 0 {
+			dt = 0.1
+		}
+		g.Update(dt)
+		g.Draw(s)
+
+		playerX := int(math.Floor(g.player.pos.X * float64(g.zoomEff)))
+		playerY := int(math.Floor(g.player.pos.Y * float64(g.zoomEff)))
+		camX, camY := g.camCell()
+		if absInt(camX-prevCamX) > absInt(playerX-prevPlayerX) ||
+			absInt(camY-prevCamY) > absInt(playerY-prevPlayerY) {
+			t.Fatalf("frame %d: camera jumped (%d,%d)->(%d,%d) while player cells moved "+
+				"(%d,%d)->(%d,%d)", frame, prevCamX, prevCamY, camX, camY,
+				prevPlayerX, prevPlayerY, playerX, playerY)
+		}
+		prevPlayerX, prevPlayerY = playerX, playerY
+		prevCamX, prevCamY = camX, camY
 	}
 }
 

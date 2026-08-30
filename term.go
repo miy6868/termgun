@@ -14,6 +14,11 @@ const (
 	seqShowCursor = "\x1b[?25h"
 	seqReset      = "\x1b[0m"
 	seqClear      = "\x1b[2J"
+	// DEC private mode 2026 asks supporting terminals to present the bytes
+	// between these markers as one frame. Unsupported terminals ignore the
+	// private mode, while supporting ones avoid showing a half-painted row.
+	seqSyncBegin = "\x1b[?2026h"
+	seqSyncEnd   = "\x1b[?2026l"
 
 	// 1003: report every mouse motion, 1006: SGR extended coordinates.
 	seqMouseOn  = "\x1b[?1003h\x1b[?1006h"
@@ -66,6 +71,11 @@ type Screen struct {
 	prev []Cell
 	out  *bufio.Writer
 
+	// motionAnchor is the current cell of the primary moving glyph. Its old
+	// position is emitted before the new frame so terminals without DEC 2026 do
+	// not briefly show both positions during vertical movement.
+	motionAnchor, prevMotionAnchor int
+
 	// buf accumulates one whole frame's escape stream so Flush hands the writer
 	// a single slice instead of a few thousand small calls, and blank holds a
 	// row of cleared cells that Clear copies from.
@@ -84,6 +94,7 @@ func (s *Screen) Resize(w, h int) {
 		return
 	}
 	s.W, s.H = w, h
+	s.motionAnchor, s.prevMotionAnchor = -1, -1
 	s.cur = make([]Cell, w*h)
 	s.prev = make([]Cell, w*h)
 	s.blank = make([]Cell, w)
@@ -104,9 +115,18 @@ func (s *Screen) Resize(w, h int) {
 // Clear resets the frame by copying a prepared blank row over the grid: copy of
 // a Cell slice compiles to a bulk move, where an element-wise loop does not.
 func (s *Screen) Clear() {
+	s.motionAnchor = -1
 	for y := 0; y < s.H; y++ {
 		copy(s.cur[y*s.W:(y+1)*s.W], s.blank)
 	}
+}
+
+// MarkMotionAnchor identifies the primary moving glyph for ordered presentation.
+func (s *Screen) MarkMotionAnchor(x, y int) {
+	if x < 0 || y < 0 || x >= s.W || y >= s.H {
+		return
+	}
+	s.motionAnchor = y*s.W + x
 }
 
 func (s *Screen) Set(x, y int, r rune, fg, bg int16) {
@@ -181,13 +201,13 @@ func (s *Screen) Str(x, y int, str string, fg, bg int16) {
 }
 
 // StrBytes draws UTF-8 bytes without copying them into a string, so callers
-// that build a label into a scratch buffer each frame allocate nothing. The
-// range over a string conversion is recognised by the compiler and does not
-// allocate either.
+// that build a label into a scratch buffer each frame allocate nothing.
 func (s *Screen) StrBytes(x, y int, b []byte, fg, bg int16) {
-	for _, r := range string(b) {
+	for len(b) > 0 {
+		r, n := utf8.DecodeRune(b)
 		s.Set(x, y, r, fg, bg)
 		x += runeWidth(r)
+		b = b[n:]
 	}
 }
 
@@ -248,69 +268,97 @@ func appendUint(b []byte, n int) []byte {
 	return append(b, byte('0'+n))
 }
 
+type frameEncoder struct {
+	buf     []byte
+	fg, bg  int16
+	cx, cy  int
+	changed bool
+}
+
+func (s *Screen) appendChangedCell(e *frameEncoder, x, y int) {
+	i := y*s.W + x
+	c := s.cur[i]
+	if c == s.prev[i] {
+		return
+	}
+	if !e.changed {
+		e.buf = append(e.buf, seqSyncBegin...)
+		e.changed = true
+	}
+	s.prev[i] = c
+	if c.R == wideCont {
+		// Emitted together with its left half, which already advanced the cursor
+		// across this column.
+		return
+	}
+	if e.cx != x || e.cy != y {
+		e.buf = append(e.buf, 0x1b, '[')
+		e.buf = appendUint(e.buf, y+1)
+		e.buf = append(e.buf, ';')
+		e.buf = appendUint(e.buf, x+1)
+		e.buf = append(e.buf, 'H')
+		e.cx, e.cy = x, y
+	}
+	if c.FG != e.fg {
+		e.fg = c.FG
+		if e.fg == colorDefault {
+			e.buf = append(e.buf, "\x1b[39m"...)
+		} else {
+			e.buf = append(e.buf, "\x1b[38;5;"...)
+			e.buf = appendUint(e.buf, int(e.fg))
+			e.buf = append(e.buf, 'm')
+		}
+	}
+	if c.BG != e.bg {
+		e.bg = c.BG
+		if e.bg == colorDefault {
+			e.buf = append(e.buf, "\x1b[49m"...)
+		} else {
+			e.buf = append(e.buf, "\x1b[48;5;"...)
+			e.buf = appendUint(e.buf, int(e.bg))
+			e.buf = append(e.buf, 'm')
+		}
+	}
+	r := c.R
+	if r == 0 {
+		r = ' '
+	}
+	if r < utf8.RuneSelf {
+		e.buf = append(e.buf, byte(r))
+		e.cx++
+	} else {
+		e.buf = utf8.AppendRune(e.buf, r)
+		e.cx += runeWidth(r)
+	}
+}
+
 func (s *Screen) Flush() {
-	fg, bg := int16(-2), int16(-2) // -2 = "unknown", forces the first emit
-	cx, cy := -1, -1
-	buf := s.buf[:0]
+	e := frameEncoder{buf: s.buf[:0], fg: -2, bg: -2, cx: -1, cy: -1}
+	// Erase the previous player cell first. Row-major output alone draws a body
+	// moving upward before it clears the lower cell, which looks like a doubled
+	// player on terminals that ignore synchronized-output markers.
+	if old := s.prevMotionAnchor; old >= 0 && old != s.motionAnchor && old < len(s.cur) {
+		s.appendChangedCell(&e, old%s.W, old/s.W)
+	}
 	for y := 0; y < s.H; y++ {
 		base := y * s.W
-		cur := s.cur[base : base+s.W]
-		prev := s.prev[base : base+s.W]
 		for x := 0; x < s.W; x++ {
-			c := cur[x]
-			if c == prev[x] {
-				continue
-			}
-			prev[x] = c
-			if c.R == wideCont {
-				// Emitted together with its left half, which already advanced
-				// the cursor across this column.
-				continue
-			}
-			if cx != x || cy != y {
-				buf = append(buf, 0x1b, '[')
-				buf = appendUint(buf, y+1)
-				buf = append(buf, ';')
-				buf = appendUint(buf, x+1)
-				buf = append(buf, 'H')
-				cx, cy = x, y
-			}
-			if c.FG != fg {
-				fg = c.FG
-				if fg == colorDefault {
-					buf = append(buf, "\x1b[39m"...)
-				} else {
-					buf = append(buf, "\x1b[38;5;"...)
-					buf = appendUint(buf, int(fg))
-					buf = append(buf, 'm')
-				}
-			}
-			if c.BG != bg {
-				bg = c.BG
-				if bg == colorDefault {
-					buf = append(buf, "\x1b[49m"...)
-				} else {
-					buf = append(buf, "\x1b[48;5;"...)
-					buf = appendUint(buf, int(bg))
-					buf = append(buf, 'm')
-				}
-			}
-			r := c.R
-			if r == 0 {
-				r = ' '
-			}
-			if r < utf8.RuneSelf {
-				buf = append(buf, byte(r))
-				cx++
-			} else {
-				buf = utf8.AppendRune(buf, r)
-				cx += runeWidth(r)
+			// Keep the common unchanged-cell check in this tight loop. Calling
+			// the full encoder for every screen cell costs more than the ordered
+			// anchor write this path exists to support.
+			i := base + x
+			if s.cur[i] != s.prev[i] {
+				s.appendChangedCell(&e, x, y)
 			}
 		}
 	}
-	buf = append(buf, seqReset...)
-	s.buf = buf[:0]
-	s.out.Write(buf)
+	e.buf = append(e.buf, seqReset...)
+	if e.changed {
+		e.buf = append(e.buf, seqSyncEnd...)
+	}
+	s.prevMotionAnchor = s.motionAnchor
+	s.buf = e.buf[:0]
+	s.out.Write(e.buf)
 	s.out.Flush()
 }
 

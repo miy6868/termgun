@@ -179,11 +179,18 @@ func TestWindowsMouseTracksTheWindow(t *testing.T) {
 	}
 }
 
-// TestWindowsWheelIsNotAClick: a wheel tick sets no button bit, and reporting it
-// as a press would fire the weapon.
-func TestWindowsWheelIsNotAClick(t *testing.T) {
-	if _, _, ok := decodeMouse(ptr(mouseRecord(5, 5, 0, 0x0004)), 0, 0, 0); ok {
-		t.Error("a wheel tick produced a mouse button event")
+func TestWindowsWheelKeepsDirection(t *testing.T) {
+	up := uint32(uint16(120)) << 16
+	downDelta := int16(-120)
+	down := uint32(uint16(downDelta)) << 16
+	for _, c := range []struct {
+		buttons uint32
+		want    int
+	}{{up, BtnWheelUp}, {down, BtnWheelDown}} {
+		ev, _, ok := decodeMouse(ptr(mouseRecord(5, 5, c.buttons, winMouseWheel)), 0, 0, 0)
+		if !ok || ev.Action != MousePress || ev.Button != c.want {
+			t.Errorf("wheel decoded as %+v (ok=%v), want button %d", ev, ok, c.want)
+		}
 	}
 }
 

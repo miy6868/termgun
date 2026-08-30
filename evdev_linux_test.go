@@ -130,6 +130,92 @@ func TestTTYEOFLeavesSharedChannelOpen(t *testing.T) {
 	}
 }
 
+func TestTTYReaderReplaysProbeLeftoverImmediately(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	events := make(chan Event, 3)
+	go readTTYEvents(r, []byte("wd"), events)
+	for i, want := range []rune{'w', 'd'} {
+		select {
+		case ev := <-events:
+			if ev.Kind != EvKey || ev.Rune != want {
+				t.Fatalf("leftover event %d = %+v, want rune %q", i, ev, want)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("leftover event %d waited for fresh terminal input", i)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-events:
+		if ev.Kind != EvStop {
+			t.Fatalf("closing terminal input produced %v, want EvStop", ev.Kind)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("terminal reader did not stop after input closed")
+	}
+}
+
+func TestLoneEscapeArrivesWithoutFollowingKey(t *testing.T) {
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+
+	var unlock int32
+	if err := ioctl(int(master.Fd()), syscall.TIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
+		t.Fatal(err)
+	}
+	var number uint32
+	if err := ioctl(int(master.Fd()), syscall.TIOCGPTN, unsafe.Pointer(&number)); err != nil {
+		t.Fatal(err)
+	}
+	slave, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", number), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slave.Close()
+
+	state, err := enterRaw(int(slave.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.restore()
+
+	events := make(chan Event, 2)
+	go readTTYEvents(slave, nil, events)
+	if _, err := master.Write([]byte{0x1b}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-events:
+		if ev.Kind != EvKey || ev.Key != KeyEscape || ev.KeyAct != KeyPress {
+			t.Fatalf("lone ESC produced %+v", ev)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("lone ESC waited for another key")
+	}
+	if err := master.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-events:
+		if ev.Kind != EvStop {
+			t.Fatalf("closing PTY produced %v, want EvStop", ev.Kind)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("terminal reader did not stop after PTY closed")
+	}
+}
+
 // TestKittyProbeTimeoutPreservesInput covers terminals that do not answer DA1.
 // Keystrokes typed during the bounded capability probe still belong to the
 // normal input stream even when no terminal reply marks the end of the probe.

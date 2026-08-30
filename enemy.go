@@ -19,6 +19,7 @@ const (
 const (
 	bossOverseer int = iota
 	bossQueen
+	bossCore
 )
 
 type EnemyDef struct {
@@ -159,6 +160,12 @@ var bossDef = EnemyDef{
 	Behavior: BeBoss, FireRate: 1.1, BulletSp: 24, Sight: 60, XP: 60, Score: 500,
 }
 
+var coreBossDef = EnemyDef{
+	Name: "CORE WARDEN", Glyph: 'C', Color: 51, HP: 520, Speed: 5.0, Damage: 22, Radius: 1.0,
+	Behavior: BeBoss, FireRate: 1.0, BulletSp: 27, Sight: 60, XP: 100, Score: 1200,
+	KnockMul: 0.18, BossKind: bossCore,
+}
+
 type Enemy struct {
 	id     int
 	def    *EnemyDef
@@ -172,6 +179,9 @@ type Enemy struct {
 	fuse   float64 // bombers
 	wander Vec
 	phase  float64
+	// lastHitWeapon attributes a kill to a weapon core. Environmental and
+	// hostile damage leave it at -1 so swapping guns cannot steal the reward.
+	lastHitWeapon int
 
 	// telegraph state
 	windup  float64 // counts down while the attack is being shown
@@ -196,10 +206,11 @@ type Enemy struct {
 	// dash-read state: a light body hopping aside from a blink, and the side
 	// this body prefers when a pack fans out around the player. The flank is
 	// derived from the id so packs split evenly without touching the RNG.
-	dodgeT   float64
-	dodgeCD  float64
-	dodgeVec Vec
-	flank    float64
+	dodgeT      float64
+	dodgeCD     float64
+	dodgeVec    Vec
+	flank       float64
+	lastDashHit float64
 }
 
 // telegraphing reports whether the enemy is visibly preparing an attack, which
@@ -484,6 +495,10 @@ func (g *Game) bossAttack(e *Enemy, dir Vec) {
 		g.queenAttack(e, dir)
 		return
 	}
+	if e.def.BossKind == bossCore {
+		g.coreAttack(e, dir)
+		return
+	}
 	switch int(e.phase/3) % 3 {
 	case 0: // fan
 		for i := -3; i <= 3; i++ {
@@ -499,6 +514,34 @@ func (g *Game) bossAttack(e *Enemy, dir Vec) {
 			a := g.rng.Float64() * math.Pi * 2
 			g.addEnemy(def, e.pos.Add(Vec{1, 0}.rotate(a).unvisual().Scale(1.6)))
 		}
+	}
+}
+
+// coreAttack alternates a rotating lattice, a tight aimed gate and support
+// nodes. The patterns remix skills learned in both earlier acts, but the
+// offset double ring belongs only to the final duel.
+func (g *Game) coreAttack(e *Enemy, dir Vec) {
+	switch int(e.phase/2.6) % 3 {
+	case 0: // offset double ring: the second ring closes the first set of gaps
+		for i := 0; i < 12; i++ {
+			a := float64(i)*math.Pi/6 + e.phase*0.35
+			g.enemyShot(e, Vec{1, 0}.rotate(a), 0)
+			g.enemyShot(e, Vec{1, 0}.rotate(a+math.Pi/12), 0)
+		}
+	case 1: // aimed gate with a readable centre lane to cross through
+		for i := -4; i <= 4; i++ {
+			if i == 0 {
+				continue
+			}
+			g.enemyShot(e, dir.rotate(float64(i)*0.10), 0)
+		}
+	case 2: // one stationary gun and one healer force a priority decision
+		for _, idx := range []int{4, 7} {
+			def := scaleForDepth(enemyDefs[idx], g.level.Depth)
+			a := e.phase + float64(idx)
+			g.addEnemy(def, e.pos.Add(Vec{1, 0}.rotate(a).unvisual().Scale(2.2)))
+		}
+		g.spawnParticles(e.pos, 12, 0.4, 51, '*')
 	}
 }
 

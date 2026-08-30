@@ -63,6 +63,7 @@ func (c *winEventCoalescer) flush(emit func(Event)) {
 // Mouse event flags and button bits.
 const (
 	winMouseMoved = 0x0001
+	winMouseWheel = 0x0004
 
 	winBtn1 = 0x0001 // leftmost
 	winBtn2 = 0x0002 // rightmost
@@ -189,7 +190,8 @@ func decodeKey(r *winRecord, held winKeyState) (ev Event, ok bool) {
 // Coordinates are relative to the screen buffer, which is not the same thing as
 // the visible window once the buffer is taller than the window.
 func decodeMouse(r *winRecord, prev uint32, originX, originY int) (ev Event, buttons uint32, ok bool) {
-	buttons = r.u32(4)
+	rawButtons := r.u32(4)
+	buttons = rawButtons & (winBtn1 | winBtn2 | winBtn3)
 	flags := r.u32(12)
 	ev = Event{
 		Kind: EvMouse,
@@ -198,6 +200,13 @@ func decodeMouse(r *winRecord, prev uint32, originX, originY int) (ev Event, but
 	}
 
 	switch {
+	case flags&winMouseWheel != 0:
+		ev.Action = MousePress
+		if int16(rawButtons>>16) > 0 {
+			ev.Button = BtnWheelUp
+		} else {
+			ev.Button = BtnWheelDown
+		}
 	case flags&winMouseMoved != 0:
 		ev.Action = MouseMove
 		ev.Button = winButton(buttons)

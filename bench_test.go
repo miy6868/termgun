@@ -15,7 +15,7 @@ const benchmarkRunFrames = 3000
 // too, for the same reason: cache bugs only show up under real movement.
 func botFrame(g *Game) {
 	switch g.state {
-	case StateLevelUp:
+	case StateLevelUp, StateWeaponCore:
 		g.handleKey(Event{Kind: EvKey, Rune: '1'})
 		return
 	case StateDead:
@@ -58,7 +58,7 @@ func botFrame(g *Game) {
 // benchGame keeps a run bounded and repeatable instead of letting benchmark
 // calibration descend forever into increasingly expensive floors.
 func benchGame(g *Game, i int) *Game {
-	if g == nil || g.state == StateDead || i%benchmarkRunFrames == 0 {
+	if g == nil || g.state == StateDead || g.state == StateVictory || i%benchmarkRunFrames == 0 {
 		g = NewGame(42)
 		g.mouseSet = true
 	}
@@ -99,5 +99,26 @@ func BenchmarkDraw(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		g.Draw(s)
+	}
+}
+
+func TestSteadyStateDrawDoesNotAllocate(t *testing.T) {
+	g := benchGame(nil, 0)
+	s := NewScreen(120, 40, bufio.NewWriter(io.Discard))
+	g.Draw(s) // warm one-time screen and label state
+
+	if got := testing.AllocsPerRun(100, func() { g.Draw(s) }); got != 0 {
+		t.Fatalf("steady-state Draw allocated %.2f objects per frame; want 0", got)
+	}
+}
+
+func TestDebugPerformanceDrawDoesNotAllocate(t *testing.T) {
+	g := benchGame(nil, 0)
+	g.debugPerf = true
+	s := NewScreen(120, 40, bufio.NewWriter(io.Discard))
+	g.Draw(s)
+
+	if got := testing.AllocsPerRun(100, func() { g.Draw(s) }); got != 0 {
+		t.Fatalf("debug performance Draw allocated %.2f objects per frame; want 0", got)
 	}
 }

@@ -49,8 +49,11 @@ func enterRaw(fd int) (*termState, error) {
 	t.Iflag &^= syscall.IXON | syscall.ICRNL | syscall.BRKINT | syscall.INPCK | syscall.ISTRIP
 	t.Oflag &^= syscall.OPOST
 	t.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
-	t.Cc[syscall.VMIN] = 1
-	t.Cc[syscall.VTIME] = 0
+	// A short idle read resolves a lone ESC without waiting for another key.
+	// Multi-byte terminal sequences normally arrive in one burst and remain
+	// buffered until complete.
+	t.Cc[syscall.VMIN] = 0
+	t.Cc[syscall.VTIME] = 1
 	if err := ioctl(fd, syscall.TCSETS, unsafe.Pointer(&t)); err != nil {
 		return nil, err
 	}

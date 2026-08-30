@@ -21,6 +21,64 @@ type fakeTerm struct {
 	cx, cy int
 }
 
+func TestLowHealthVignetteDoesNotOverlapBossBar(t *testing.T) {
+	g := arena(t, 141)
+	g.player.hp = g.player.maxHP * 0.10
+	g.addEnemy(bossDef, Vec{20.5, 4.5})
+	g.enemies[0].alert = true
+	s := newTestScreen(80, 24)
+
+	g.Draw(s)
+	if strings.Contains(screenRow(s, hudTop), bossDef.Name) {
+		t.Fatal("boss bar still occupies the low-health border row")
+	}
+	if !strings.Contains(screenRow(s, hudTop+1), bossDef.Name) {
+		t.Fatal("boss bar was not moved to the protected inner row")
+	}
+}
+
+func TestFlushPresentsChangedFrameSynchronously(t *testing.T) {
+	var out bytes.Buffer
+	s := NewScreen(20, 5, bufio.NewWriter(&out))
+	s.out.Flush() // discard Resize's initial clear sequence
+	out.Reset()
+	s.Clear()
+	s.Str(0, 0, "frame", 231, colorDefault)
+	s.Flush()
+
+	b := out.Bytes()
+	if !bytes.Contains(b, []byte(seqSyncBegin)) || !bytes.HasSuffix(b, []byte(seqSyncEnd)) {
+		t.Fatalf("changed frame is not enclosed by synchronized-output markers: %q", b)
+	}
+}
+
+func TestFlushErasesOldPlayerBeforeDrawingNewPosition(t *testing.T) {
+	var out bytes.Buffer
+	s := NewScreen(20, 5, bufio.NewWriter(&out))
+	s.Clear()
+	s.Set(5, 3, '@', colPlayer, colorDefault)
+	s.MarkMotionAnchor(5, 3)
+	s.Flush()
+	out.Reset()
+
+	// Moving upward puts the new cell earlier in a row-major diff. A terminal
+	// without synchronized-output support must still see the old body erased
+	// before the new one appears, or both are visible during the frame.
+	s.Clear()
+	s.Set(5, 3, '.', colFloorLit, colorDefault)
+	s.Set(5, 2, '@', colPlayer, colorDefault)
+	s.MarkMotionAnchor(5, 2)
+	s.Flush()
+	frame := out.Bytes()
+	erased, drawn := bytes.IndexByte(frame, '.'), bytes.IndexByte(frame, '@')
+	if erased < 0 || drawn < 0 {
+		t.Fatalf("player move did not emit both cells: %q", frame)
+	}
+	if erased > drawn {
+		t.Fatalf("new player was emitted before the old position was erased: %q", frame)
+	}
+}
+
 // termWidth is deliberately an independent implementation of the width rule.
 // If the emulator reused the renderer's own runeWidth, the two would agree even
 // when both are wrong, and the test would prove nothing.
@@ -246,12 +304,14 @@ func TestUIAvoidsAmbiguousWidthGlyphs(t *testing.T) {
 		page  int
 	}{
 		{StatePlaying, 0},
+		{StateWeaponCore, 0},
 		{StateHelp, 0},
 		{StateHelp, 1},
 		{StateHelp, 2},
 		{StateSettings, 0},
 		{StatePaused, 0},
 		{StateDead, 0},
+		{StateVictory, 0},
 	}
 	for _, tc := range cases {
 		g.state, g.helpPage = tc.state, tc.page

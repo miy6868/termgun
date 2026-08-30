@@ -111,6 +111,11 @@ func (g *Game) meleeSwing(origin, dir Vec) {
 	p := &g.player
 	w := &weapons[wpMelee]
 	minCos := math.Cos(w.Arc / 2)
+	damageMul := 1.0
+	if g.coreEchoes(wpMelee) {
+		damageMul += coreEchoDamage
+		g.spawnParticles(origin, 8, 0.2, 51, '/')
+	}
 
 	for i := range g.enemies {
 		e := &g.enemies[i]
@@ -126,7 +131,8 @@ func (g *Game) meleeSwing(origin, dir Vec) {
 				continue
 			}
 		}
-		g.hurtEnemy(e, w.Damage*p.damageMul*p.meleeMul, dir.Scale(w.Knock))
+		e.lastHitWeapon = wpMelee
+		g.hurtEnemy(e, w.Damage*p.damageMul*p.meleeMul*damageMul, dir.Scale(w.Knock))
 	}
 
 	// Sweep of particles so the swing reads on screen.
@@ -143,35 +149,47 @@ func (g *Game) meleeSwing(origin, dir Vec) {
 func (g *Game) fire(w *Weapon, origin Vec, dir Vec) {
 	p := &g.player
 	pellets := w.Pellets + p.extraShots
-	for i := 0; i < pellets; i++ {
-		spread := w.Spread
-		if pellets > 1 {
-			spread = math.Max(spread, 0.05)
+	volleys := 1
+	if g.coreEchoes(p.weapon) {
+		volleys = 2
+	}
+	for volley := 0; volley < volleys; volley++ {
+		for i := 0; i < pellets; i++ {
+			spread := w.Spread
+			if pellets > 1 {
+				spread = math.Max(spread, 0.05)
+			}
+			a := (g.rng.Float64()*2 - 1) * spread
+			dmgMul, color := 1.0, w.Color
+			if volley > 0 {
+				a += coreEchoAngle
+				dmgMul, color = coreEchoDamage, int16(51)
+			}
+			d := dir.rotate(a)
+			b := Bullet{
+				pos:      origin,
+				vel:      d.unvisual().Scale(w.Speed),
+				dmg:      w.Damage * p.damageMul * dmgMul,
+				life:     w.Range / w.Speed,
+				glyph:    w.Glyph,
+				color:    color,
+				pierce:   w.Pierce + p.pierce,
+				knock:    w.Knock,
+				explode:  w.Name == "Launcher",
+				friendly: true,
+				weapon:   p.weapon,
+			}
+			g.bullets = append(g.bullets, b)
 		}
-		a := (g.rng.Float64()*2 - 1) * spread
-		d := dir.rotate(a)
-		b := Bullet{
-			pos:      origin,
-			vel:      d.unvisual().Scale(w.Speed),
-			dmg:      w.Damage * p.damageMul,
-			life:     w.Range / w.Speed,
-			glyph:    w.Glyph,
-			color:    w.Color,
-			pierce:   w.Pierce + p.pierce,
-			knock:    w.Knock,
-			explode:  w.Name == "Launcher",
-			friendly: true,
-		}
-		g.bullets = append(g.bullets, b)
 	}
 	// Muzzle flash: sparks thrown forward in a narrow cone, so the gun clearly
 	// fires down its own barrel rather than puffing in place.
 	for i := 0; i < muzzleSparks; i++ {
-		a := (g.rng.Float64()*2 - 1) * 0.35
+		a := (g.fxRNG.Float64()*2 - 1) * 0.35
 		vd := dir.rotate(a)
 		g.parts = append(g.parts, Particle{
 			pos:  origin.Add(dir.unvisual().Scale(0.6)),
-			vel:  vd.unvisual().Scale(9 + g.rng.Float64()*10),
+			vel:  vd.unvisual().Scale(9 + g.fxRNG.Float64()*10),
 			life: 0.09, max: 0.09,
 			glyph: '*', color: 226,
 		})

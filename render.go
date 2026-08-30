@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -32,6 +33,17 @@ const (
 	pressWidth = 11 + 6
 )
 
+// hudScratch keeps transient UTF-8 labels on the Game instead of the heap.
+// Draw is single-threaded, and every label is consumed before its buffer is
+// reused on the next frame.
+type hudScratch struct {
+	right               [96]byte
+	hp, pressure        [32]byte
+	number              [16]byte
+	level               [24]byte
+	fullHint, shortHint [48]byte
+}
+
 // camCell is the camera in whole cells.
 //
 // Everything drawn has to derive from this one integer, or the terrain grid and
@@ -47,7 +59,14 @@ const (
 // whole cell in the first place.
 func (g *Game) camCell() (int, int) {
 	z := float64(g.zoomEff)
-	return int(math.Floor(g.camX * z)), int(math.Floor(g.camY * z))
+	return cameraCell(g.camX, z), cameraCell(g.camY, z)
+}
+
+func cameraCell(position, zoom float64) int {
+	// updateCamera stores exact cell steps as cell/zoom. At zoom 3 that quotient
+	// cannot be represented exactly, so tolerate its sub-ulp roundoff without
+	// changing the floor rule for genuinely fractional test and camera values.
+	return int(math.Floor(position*zoom + 1e-9))
 }
 
 // worldToScreen keeps sub-tile precision: at any zoom above 1 a bullet crossing
@@ -91,10 +110,15 @@ func (g *Game) Draw(s *Screen) {
 	}
 	// Over the map so the minimap frame cannot crowd it off the top row.
 	g.drawBossBar(s)
+	if g.debugPerf && g.state == StatePlaying {
+		g.drawDebugPerf(s)
+	}
 
 	switch g.state {
 	case StateLevelUp:
 		g.drawPerkMenu(s)
+	case StateWeaponCore:
+		g.drawWeaponCoreMenu(s)
 	case StateHelp:
 		g.drawHelp(s)
 	case StateSettings:
@@ -104,6 +128,8 @@ func (g *Game) Draw(s *Screen) {
 			[]string{"ESC / P 로 계속", "[?] 조작 안내", "[O] 설정", "[Q] 종료"}, colHUDAccent)
 	case StateDead:
 		g.drawGameOver(s)
+	case StateVictory:
+		g.drawVictory(s)
 	}
 }
 
@@ -118,37 +144,108 @@ const deadzone = 0.18
 // size of each jump but whether the jumps arrive at a steady rhythm. Easing
 // makes the camera accelerate, which spreads the cell crossings unevenly (one
 // after two frames, the next after three) and reads as stutter. Tracking the
-// player exactly means the camera moves at the player's constant speed, so the
-// crossings are evenly spaced. The dead zone then removes most of the scrolling
-// altogether: walking around a room moves nothing at all.
+// player in terminal-cell steps means the camera moves at the player's constant
+// screen cadence without putting the body on alternating sides of a rounding
+// boundary. The dead zone then removes most scrolling altogether: walking
+// around a room moves nothing at all.
 func (g *Game) updateCamera() {
 	p := g.player.pos
-	// Follow on each axis only once the player leaves the dead zone, then keep
-	// exactly level with them.
-	follow := func(cam, pos, view float64) float64 {
-		half := view / 2
-		dz := view * deadzone
-		if lo := pos - (half - dz); cam > lo {
-			cam = lo
-		}
-		if hi := pos - (half + dz); cam < hi {
-			cam = hi
-		}
-		return cam
+	z := float64(g.zoomEff)
+	playerX := int(math.Floor(p.X * z))
+	playerY := int(math.Floor(p.Y * z))
+	oldCamX, oldCamY := cameraCell(g.camX, z), cameraCell(g.camY, z)
+	deltaX, deltaY := 0, 0
+	stableView := g.camPlayerSet && g.camPlayerZoom == g.zoomEff &&
+		g.camPlayerTilesW == g.tilesW && g.camPlayerTilesH == g.tilesH
+	if stableView {
+		deltaX = playerX - g.camPlayerX
+		deltaY = playerY - g.camPlayerY
+	} else {
+		g.camLockX, g.camLockY = 0, 0
 	}
-	g.camX = follow(g.camX, p.X, float64(g.tilesW))
-	g.camY = follow(g.camY, p.Y, float64(g.tilesH))
-
-	g.camX = clampF(g.camX, 0, math.Max(0, float64(g.level.W-g.tilesW)))
-	g.camY = clampF(g.camY, 0, math.Max(0, float64(g.level.H-g.tilesH)))
+	// Evaluate and follow in terminal cells. Subtracting two independently
+	// floored world coordinates made their fractional phases disagree, so while
+	// the camera tracked, the player alternated between adjacent screen cells.
+	follow := func(cam float64, playerAt int, view float64, levelSize int) (int, int, int) {
+		camAt := cameraCell(cam, z)
+		lo := int(math.Round((view/2 - view*deadzone) * z))
+		hi := int(math.Round((view/2 + view*deadzone) * z))
+		relative := playerAt - camAt
+		if relative < lo {
+			camAt = playerAt - lo
+		} else if relative > hi {
+			camAt = playerAt - hi
+		}
+		maxAt := max(0, (levelSize-int(view))*g.zoomEff)
+		camAt = clamp(camAt, 0, maxAt)
+		return camAt, lo, hi
+	}
+	camX, loX, hiX := follow(g.camX, playerX, float64(g.tilesW), g.level.W)
+	camY, loY, hiY := follow(g.camY, playerY, float64(g.tilesH), g.level.H)
+	maxX := max(0, (g.level.W-g.tilesW)*g.zoomEff)
+	maxY := max(0, (g.level.H-g.tilesH)*g.zoomEff)
+	dir := g.moveDir()
+	sign := func(v float64) int {
+		switch {
+		case v < 0:
+			return -1
+		case v > 0:
+			return 1
+		default:
+			return 0
+		}
+	}
+	dirX, dirY := sign(dir.X), sign(dir.Y)
+	if g.camLockX != 0 && g.camLockX != dirX {
+		g.camLockX = 0
+	}
+	if g.camLockY != 0 && g.camLockY != dirY {
+		g.camLockY = 0
+	}
+	relX, relY := playerX-camX, playerY-camY
+	trackingX := relX == loX && dirX < 0 && camX > 0 ||
+		relX == hiX && dirX > 0 && camX < maxX
+	trackingY := relY == loY && dirY < 0 && camY > 0 ||
+		relY == hiY && dirY > 0 && camY < maxY
+	if trackingX {
+		g.camLockX = dirX
+	}
+	if trackingY {
+		g.camLockY = dirY
+	}
+	if g.camLockX != 0 || g.camLockY != 0 {
+		// Once one axis owns the camera, an added diagonal axis must join that
+		// same scroll immediately. Letting it cross a fresh dead zone mixes body
+		// motion with world motion and reads as shaking despite both being smooth
+		// in isolation. A level-bound clamp can leave the player outside the
+		// dead zone, though; preserving that invalid anchor stores a correction
+		// which snaps into place when movement stops. Let the player cross back
+		// into the dead zone before that axis joins the camera.
+		if dirX != 0 && (g.camLockX != 0 || relX >= loX && relX <= hiX) {
+			g.camLockX = dirX
+		}
+		if dirY != 0 && (g.camLockY != 0 || relY >= loY && relY <= hiY) {
+			g.camLockY = dirY
+		}
+	}
+	if g.camLockX != 0 && stableView {
+		camX = clamp(oldCamX+deltaX, 0, maxX)
+	}
+	if g.camLockY != 0 && stableView {
+		camY = clamp(oldCamY+deltaY, 0, maxY)
+	}
+	g.camX, g.camY = float64(camX)/z, float64(camY)/z
+	g.camPlayerX, g.camPlayerY = playerX, playerY
+	g.camPlayerZoom, g.camPlayerSet = g.zoomEff, true
+	g.camPlayerTilesW, g.camPlayerTilesH = g.tilesW, g.tilesH
 
 	// Shake is a whole-cell offset applied on top of the camera rather than a
 	// nudge to it: it stays the same size on screen at any zoom, and it cannot
 	// drag the camera out of its dead zone or fight the level-bounds clamp.
 	g.shakeX, g.shakeY = 0, 0
 	if g.screenShake && g.shake > 0 {
-		g.shakeX = int(math.Round((g.rng.Float64()*2 - 1) * g.shake * 6))
-		g.shakeY = int(math.Round((g.rng.Float64()*2 - 1) * g.shake * 3))
+		g.shakeX = int(math.Round((g.fxRNG.Float64()*2 - 1) * g.shake * 6))
+		g.shakeY = int(math.Round((g.fxRNG.Float64()*2 - 1) * g.shake * 3))
 	}
 }
 
@@ -168,6 +265,7 @@ func (g *Game) drawLevel(s *Screen) {
 	// frame, and At/Visible/Explored each repeat the same bounds test and the
 	// same y*W+x on the way to adjacent bytes.
 	lv := g.level
+	wallLit, floorLit, floorMid := actPalette(g.depth)
 	for ty := -my; ty <= g.tilesH+my; ty++ {
 		wy := oy + ty
 		if wy < 0 || wy >= lv.H {
@@ -206,7 +304,7 @@ func (g *Game) drawLevel(s *Screen) {
 				if vis {
 					switch tier {
 					case 0:
-						fg = colWallLit
+						fg = wallLit
 					case 1:
 						fg = 244
 					}
@@ -240,9 +338,9 @@ func (g *Game) drawLevel(s *Screen) {
 				if vis {
 					switch tier {
 					case 0:
-						fg = colFloorLit
+						fg = floorLit
 					case 1:
-						fg = 238
+						fg = floorMid
 					default:
 						fg = colFloorDim
 					}
@@ -254,9 +352,9 @@ func (g *Game) drawLevel(s *Screen) {
 				if vis {
 					switch tier {
 					case 0:
-						fg = colFloorLit
+						fg = floorLit
 					case 1:
-						fg = 238
+						fg = floorMid
 					default:
 						fg = colFloorDim
 					}
@@ -437,6 +535,7 @@ func (g *Game) drawEntities(s *Screen) {
 		pc = 196
 	}
 	g.put(s, px, py, '@', pc)
+	s.MarkMotionAnchor(px, py)
 
 	// Damage direction marker: a pair of stars on the side the last hit came
 	// from, so "which way do I dodge" survives the flash.
@@ -641,6 +740,9 @@ func appendSlotLabel(b []byte, p *Player, i int, abbrev bool) []byte {
 		b = append(b, ' ')
 		b = append(b, weapons[i].Name...)
 	}
+	if i < len(p.cores) && p.cores[i] != 0 {
+		b = append(b, '*')
+	}
 	if weapons[i].needsAmmo() {
 		b = append(b, ' ')
 		b = appendUint(b, p.ammo[i])
@@ -670,13 +772,14 @@ func reservedSlotLen(i int, abbrev bool) int {
 
 // slotBarWidth measures the bar at its widest, using each weapon's full
 // magazine, so the layout does not reflow every time a round is spent.
-func slotBarWidth(abbrev, label bool) int {
+func slotBarWidth(p *Player, abbrev, label bool) int {
 	n := len(weapons) - 1 // gaps between chips
 	if label {
 		n += 5 // the "무기" prefix
 	}
 	for i := range weapons {
-		n += reservedSlotLen(i, abbrev)
+		actual := len(appendSlotLabel(slotBuf[:0], p, i, abbrev))
+		n += maxInt(reservedSlotLen(i, abbrev), actual)
 	}
 	return n
 }
@@ -717,6 +820,24 @@ func drawSlots(s *Screen, x, y int, p *Player, abbrev, label bool) int {
 	return x
 }
 
+func appendPaddedFloat0(dst, scratch []byte, value float64, width int) []byte {
+	scratch = strconv.AppendFloat(scratch[:0], value, 'f', 0, 64)
+	for i := len(scratch); i < width; i++ {
+		dst = append(dst, ' ')
+	}
+	return append(dst, scratch...)
+}
+
+func appendElapsed(dst []byte, elapsed float64) []byte {
+	seconds := int(elapsed)
+	dst = appendUint(dst, seconds/60)
+	dst = append(dst, ':')
+	if seconds%60 < 10 {
+		dst = append(dst, '0')
+	}
+	return appendUint(dst, seconds%60)
+}
+
 // ---- HUD --------------------------------------------------------------------
 
 func (g *Game) drawHUD(s *Screen) {
@@ -730,14 +851,26 @@ func (g *Game) drawHUD(s *Screen) {
 	s.Fill(0, 1, s.W, 1, ' ', colHUDText, 234)
 
 	// --- row 0: vitals, dash, level, progress -------------------------------
-	right := fmt.Sprintf("B%d층 | 처치 %d | 점수 %d | %s", g.depth, g.kills, g.score, fmtTime(g.elapsed))
+	right := append(g.hud.right[:0], 'B')
+	right = appendUint(right, g.depth)
+	right = append(right, "층 | 처치 "...)
+	right = appendUint(right, g.kills)
+	right = append(right, " | 점수 "...)
+	right = appendUint(right, g.score)
+	right = append(right, " | "...)
+	right = appendElapsed(right, g.elapsed)
 	// Drop the clock before dropping any ability readout: the elapsed time is
 	// flavour, whereas the dash and level gauges teach mechanics.
-	if strWidth(right)+minHPWidth+dashWidth+levelWidth+2 > s.W {
-		right = fmt.Sprintf("B%d층 | %d | %d", g.depth, g.kills, g.score)
+	if bytesWidth(right)+minHPWidth+dashWidth+levelWidth+2 > s.W {
+		right = append(g.hud.right[:0], 'B')
+		right = appendUint(right, g.depth)
+		right = append(right, "층 | "...)
+		right = appendUint(right, g.kills)
+		right = append(right, " | "...)
+		right = appendUint(right, g.score)
 	}
-	rx := maxInt(s.W-strWidth(right)-1, 1)
-	s.Str(rx, 0, right, colHUDAccent, 235)
+	rx := maxInt(s.W-bytesWidth(right)-1, 1)
+	s.StrBytes(rx, 0, right, colHUDAccent, 235)
 
 	x := 1
 	fits := func(n int) bool { return x+n < rx }
@@ -761,15 +894,20 @@ func (g *Game) drawHUD(s *Screen) {
 	// the gauge already shows health, while nothing else hints that a dash, a
 	// levelling system or a decaying floor bonus exists.
 	if x+9+dashWidth+levelWidth+pressWidth < rx {
-		s.Str(x, 0, fmt.Sprintf("%3.0f/%3.0f", p.hp, p.maxHP), colHUDText, 235)
+		hpText := appendPaddedFloat0(g.hud.hp[:0], g.hud.number[:0], p.hp, 3)
+		hpText = append(hpText, '/')
+		hpText = appendPaddedFloat0(hpText, g.hud.number[:0], p.maxHP, 3)
+		s.StrBytes(x, 0, hpText, colHUDText, 235)
 		x += 9
 	}
 
-	// Dash shows as a refilling gauge, which reads at a glance and also tells a
-	// new player the ability exists in the first place.
-	dashFrac, dashCol := 1.0, int16(51)
-	if p.dashCD > 0 {
-		dashFrac, dashCol = 1-p.dashCD/p.dashMax, 240
+	// Dash is a spendable pool: one segment costs 30, so a full base gauge
+	// visibly promises three short steps instead of one long cooldown.
+	dashFrac, dashCol := p.dashEnergy/p.dashEnergyMax, int16(51)
+	if p.dashEnergy+1e-9 < dashEnergyCost {
+		dashCol = 240
+	} else if hpFrac < 0.10 {
+		dashCol = 203
 	}
 	if fits(dashWidth) {
 		s.Str(x, 0, "| DASH ", dashCol, 235)
@@ -778,8 +916,11 @@ func (g *Game) drawHUD(s *Screen) {
 		x += 7
 	}
 
-	if lv := fmt.Sprintf("| Lv%d ", p.level); fits(len(lv) + 8) {
-		s.Str(x, 0, lv, 213, 235)
+	lv := append(g.hud.level[:0], "| Lv"...)
+	lv = appendUint(lv, p.level)
+	lv = append(lv, ' ')
+	if fits(len(lv) + 8) {
+		s.StrBytes(x, 0, lv, 213, 235)
 		x += len(lv)
 		drawGauge(s, x, 0, 8, float64(p.xp)/float64(p.xpNext), 213, 238)
 		x += 9
@@ -789,8 +930,10 @@ func (g *Game) drawHUD(s *Screen) {
 	// actually trading away by staying, and the gauge fills towards the point
 	// where reinforcements start — both have to be visible for "go now or clear
 	// the floor" to be a decision rather than a surprise.
-	prLabel := fmt.Sprintf("| 층 x%.2f ", g.descentMul())
-	if pf := g.pressureFrac(); fits(strWidth(prLabel) + 6) {
+	prLabel := append(g.hud.pressure[:0], "| 층 x"...)
+	prLabel = strconv.AppendFloat(prLabel, g.descentMul(), 'f', 2, 64)
+	prLabel = append(prLabel, ' ')
+	if pf := g.pressureFrac(); fits(bytesWidth(prLabel) + 6) {
 		col := int16(84)
 		switch {
 		case pf >= 1:
@@ -798,8 +941,8 @@ func (g *Game) drawHUD(s *Screen) {
 		case pf > 0.7:
 			col = 214
 		}
-		s.Str(x, 0, prLabel, col, 235)
-		x += strWidth(prLabel)
+		s.StrBytes(x, 0, prLabel, col, 235)
+		x += bytesWidth(prLabel)
 		drawGauge(s, x, 0, 6, pf, col, 238)
 		x += 7
 	}
@@ -809,27 +952,26 @@ func (g *Game) drawHUD(s *Screen) {
 	// layout gets progressively more terse until it fits.
 	// The zoom rides along on the hint: it is the one setting whose current
 	// value the player cannot read off the playfield itself.
-	zoom := fmt.Sprintf("[O] 배율x%d", g.zoomEff)
-	layouts := []struct {
-		abbrev, label bool
-		hint          string
-	}{
-		{false, true, zoom + "  [?] 도움말"},
-		{true, true, zoom + "  [?] 도움말"},
-		{true, true, zoom + "  [?]"},
-		{true, true, "[?]"},
-		{true, false, "[?]"},
+	fullHint := append(g.hud.fullHint[:0], "[O] 배율x"...)
+	fullHint = appendUint(fullHint, g.zoomEff)
+	shortHint := append(g.hud.shortHint[:0], fullHint...)
+	fullHint = append(fullHint, "  [?] 도움말"...)
+	shortHint = append(shortHint, "  [?]"...)
+	plainHint := []byte("[?]")
+	abbrev, label, hint := true, false, plainHint
+	switch {
+	case slotBarWidth(p, false, true)+bytesWidth(fullHint)+3 <= s.W:
+		abbrev, label, hint = false, true, fullHint
+	case slotBarWidth(p, true, true)+bytesWidth(fullHint)+3 <= s.W:
+		abbrev, label, hint = true, true, fullHint
+	case slotBarWidth(p, true, true)+bytesWidth(shortHint)+3 <= s.W:
+		abbrev, label, hint = true, true, shortHint
+	case slotBarWidth(p, true, true)+bytesWidth(plainHint)+3 <= s.W:
+		abbrev, label, hint = true, true, plainHint
 	}
-	chosen := layouts[len(layouts)-1]
-	for _, l := range layouts {
-		if slotBarWidth(l.abbrev, l.label)+strWidth(l.hint)+3 <= s.W {
-			chosen = l
-			break
-		}
-	}
-	drawSlots(s, 1, 1, p, chosen.abbrev, chosen.label)
-	if hintX := s.W - strWidth(chosen.hint) - 1; hintX > 1 {
-		s.Str(hintX, 1, chosen.hint, colHUDAccent, 234)
+	drawSlots(s, 1, 1, p, abbrev, label)
+	if hintX := s.W - bytesWidth(hint) - 1; hintX > 1 {
+		s.StrBytes(hintX, 1, hint, colHUDAccent, 234)
 	}
 
 	g.drawPrompt(s)
@@ -879,6 +1021,9 @@ func (g *Game) drawHUD(s *Screen) {
 			s.Str((s.W-strWidth(hint))/2, s.H-hudBottom-1, hint, 231, 196)
 		} else {
 			hint := " [E] 다음 층으로 "
+			if g.depth >= campaignDepth {
+				hint = " [E] 코어를 빠져나간다 "
+			}
 			s.Str((s.W-strWidth(hint))/2, s.H-hudBottom-1, hint, 232, 226)
 		}
 	}
@@ -913,7 +1058,9 @@ func (g *Game) drawBossBar(s *Screen) {
 		return
 	}
 	x := maxInt((s.W-(strWidth(name)+1+w))/2, 0)
-	y := hudTop
+	// The low-health vignette owns the outer playfield row. Keep the boss bar
+	// one row inward so its red empty gauge cannot merge into that border.
+	y := hudTop + 1
 	s.Str(x, y, name, 231, 234)
 	drawGauge(s, x+strWidth(name)+1, y, w, clampF(b.hp/b.maxHP, 0, 1), 196, 52)
 }
@@ -927,20 +1074,76 @@ func (g *Game) drawMinimap(s *Screen) {
 	ox := s.W - mw - 2
 	oy := hudTop + 1
 	s.Fill(ox-1, oy-1, mw+2, mh+2, ' ', colHUDText, 233)
+	for x := ox; x < ox+mw; x++ {
+		s.Set(x, oy-1, '-', 240, 233)
+		s.Set(x, oy+mh, '-', 240, 233)
+	}
+	for y := oy; y < oy+mh; y++ {
+		s.Set(ox-1, y, '|', 240, 233)
+		s.Set(ox+mw, y, '|', 240, 233)
+	}
+	title := " " + actName(g.depth) + " "
+	if strWidth(title) < mw {
+		s.Str(ox+1, oy-1, title, colHUDAccent, 233)
+	}
 	for y := 0; y < mh; y++ {
 		for x := 0; x < mw; x++ {
 			wx, wy := (sx+x)*2, (sy+y)*2
-			if !g.level.Explored(wx, wy) {
+			explored, open, stairs, acid, cracked := false, false, false, false, false
+			// One minimap cell represents 2x2 world tiles. Sampling only the
+			// upper-left tile used to erase one-tile corridors and any stair
+			// placed on an odd coordinate, so aggregate the whole block.
+			for dy := 0; dy < 2; dy++ {
+				for dx := 0; dx < 2; dx++ {
+					tx, ty := wx+dx, wy+dy
+					if !g.level.Explored(tx, ty) {
+						continue
+					}
+					explored = true
+					tile := g.level.At(tx, ty)
+					open = open || !tile.solid()
+					stairs = stairs || tile == TileStairs
+					acid = acid || tile == TileAcid
+					cracked = cracked || tile == TileCracked
+				}
+			}
+			if !explored {
 				continue
 			}
 			r, c := ' ', int16(238)
-			if !g.level.Solid(wx, wy) {
+			switch {
+			case stairs:
+				r, c = '>', 226
+			case acid:
+				r, c = '~', 47
+			case cracked && !open:
+				r, c = '%', 180
+			case open:
 				r, c = '.', 244
 			}
-			if g.level.At(wx, wy) == TileStairs {
-				r, c = '>', 226
-			}
 			s.Set(ox+x, oy+y, r, c, 233)
+		}
+	}
+	// Special-room icons appear only after their centre has been explored.
+	// They turn the minimap into a memory aid without revealing the seed.
+	for i, room := range g.level.rooms {
+		if i >= len(g.level.roomKind) {
+			break
+		}
+		cx, cy := room.center()
+		if !g.level.Explored(cx, cy) {
+			continue
+		}
+		gl, col := rune(0), int16(0)
+		switch g.level.roomKind[i] {
+		case RoomTreasure:
+			gl, col = 't', 220
+		case RoomAmbush:
+			gl, col = '!', 203
+		}
+		ex, ey := cx/2-sx, cy/2-sy
+		if gl != 0 && ex >= 0 && ex < mw && ey >= 0 && ey < mh {
+			s.Set(ox+ex, oy+ey, gl, col, 233)
 		}
 	}
 	// Landmarks under actors: a shrine you found but never used is worth
@@ -967,6 +1170,31 @@ func (g *Game) drawMinimap(s *Screen) {
 		if ex >= 0 && ex < mw && ey >= 0 && ey < mh &&
 			g.level.Visible(int(e.pos.X), int(e.pos.Y)) {
 			s.Set(ox+ex, oy+ey, 'x', 196, 233)
+		}
+	}
+	// Search assistance never draws a route. The second stage identifies only
+	// a coarse 3x3 sector; the final stage pins the actual target (or the map
+	// edge in its direction when it is outside this centred minimap window).
+	if g.objectiveHint >= 2 {
+		target, _, boss := g.objectiveTarget()
+		if boss || !g.level.Explored(int(target.X), int(target.Y)) {
+			ex := clamp(int(target.X)/2-sx, 0, mw-1)
+			ey := clamp(int(target.Y)/2-sy, 0, mh-1)
+			glyph, col := '?', int16(51)
+			if g.objectiveHint == 2 {
+				ex = clamp((ex*3/maxInt(mw, 1))*mw/3+mw/6, 0, mw-1)
+				ey = clamp((ey*3/maxInt(mh, 1))*mh/3+mh/6, 0, mh-1)
+				if int(g.elapsed*3)%2 != 0 {
+					glyph = 0
+				}
+			} else if boss {
+				glyph, col = '!', 203
+			} else {
+				glyph, col = '>', 226
+			}
+			if glyph != 0 {
+				s.Set(ox+ex, oy+ey, glyph, col, 233)
+			}
 		}
 	}
 	s.Set(ox+int(g.player.pos.X)/2-sx, oy+int(g.player.pos.Y)/2-sy, '@', 231, 233)
@@ -1025,6 +1253,19 @@ func (g *Game) drawPerkMenu(s *Screen) {
 	g.drawCenterBox(s, fmt.Sprintf("레벨 %d - 특성 선택", g.player.level), lines, 213)
 }
 
+func (g *Game) drawWeaponCoreMenu(s *Screen) {
+	lines := []string{
+		weapons[g.coreWeapon].Name + "을(를) 진화시킬 코어를 선택하세요.",
+		"무기 이름의 * 표시는 코어 장착을 뜻합니다.",
+		"",
+	}
+	for i, core := range g.coreChoices {
+		lines = append(lines, fmt.Sprintf("[%d] %s - %s", i+1, core.Name(), core.Desc()))
+	}
+	lines = append(lines, "", "숫자 키로 하나를 선택하세요")
+	g.drawCenterBox(s, "보스 코어 - "+actName(g.depth), lines, 51)
+}
+
 // drawPrompt puts a one-line banner at the foot of the playfield for whatever
 // the player is currently standing next to. A shrine's trade in particular has
 // to be readable *before* committing to it — otherwise the choice is a coin
@@ -1041,7 +1282,24 @@ func (g *Game) drawPrompt(s *Screen) {
 		if g.stairsBlocked() {
 			text, col = fmt.Sprintf("%s를 처치해야 계단이 열린다", g.bossEnemy().def.Name), 203
 		} else {
-			text, col = fmt.Sprintf("[E] 다음 층으로 (보너스 배율 x%.2f)", g.descentMul()), colStairs
+			if g.depth >= campaignDepth {
+				text, col = fmt.Sprintf("[E] 귀환한다 (최종 보너스 x%.2f)", g.descentMul()), colStairs
+			} else {
+				text, col = fmt.Sprintf("[E] 다음 층으로 (보너스 배율 x%.2f)", g.descentMul()), colStairs
+			}
+		}
+	case g.objectiveHint > 0:
+		target, name, boss := g.objectiveTarget()
+		if !boss && g.level.Explored(int(target.X), int(target.Y)) {
+			return
+		}
+		switch g.objectiveHint {
+		case 1:
+			text, col = fmt.Sprintf("목표: %s %s쪽", name, objectiveDirection(g.player.pos, target)), 117
+		case 2:
+			text, col = fmt.Sprintf("목표: %s 구역이 [M] 미니맵에서 점멸 중", name), 51
+		default:
+			text, col = fmt.Sprintf("목표: %s 위치가 [M] 미니맵에 표시됨", name), 226
 		}
 	default:
 		return
@@ -1059,16 +1317,16 @@ func (g *Game) drawHelp(s *Screen) {
 	mode := g.inputMode.String()
 	modeNote := "두 방향을 함께 누르면 대각선으로 이동합니다."
 	if g.inputMode == InputCompat {
-		modeNote = "이 터미널은 키를 뗀 것을 알려주지 않아 대각선이 불안정합니다."
+		modeNote = "레거시 호환 입력은 정상 플레이를 보장하지 않습니다. 정밀 입력을 권장합니다."
 	}
 	controls := []string{
-		"[이동]   W A S D 또는 방향키 (두 개를 함께 누르면 대각선)",
+		"[이동]   W A S D 또는 방향키 (즉시 가속/급정지, 두 개를 함께 누르면 대각선)",
 		"[조준]   마우스",
 		"[사격]   마우스 좌클릭 (누르고 있으면 연사)",
-		"[대시]   Space 또는 우클릭 - 짧은 무적. 적을 몸으로 부수면 피해를 주고,",
-		"         공격을 스치면 [완벽 회피]. 눈치 빠른 적(w b m)은 흩어져 비켜선다",
-		"[무기]   1~5 (획득한 것만) - 상단 목록에서 회색은 미획득, 어두운 숫자는 탄약 0",
-		"[근접]   6 - 탄약이 필요 없고 언제나 사용 가능. 짧은 사거리 부채꼴 공격",
+		"[대시]   Space 또는 우클릭 - 에너지 30으로 짧게 전진. 빠른 직진 연속 입력은 속도와 거리 증가",
+		"         매번 방향을 다시 정하며 [완벽 회피] 시 연속 대시당 에너지 20 반환",
+		"[무기]   1~6 또는 휠/[ ] - 사용 가능한 무기를 즉시 순환",
+		"[근접]   F/중클릭은 무기를 바꾸지 않고 즉시 휘두름. 6은 근접 무기로 고정",
 		"[계단]   > 위에서 E - 다음 층으로. 제단($) 앞에서도 E",
 		"[지도]   Tab 또는 M      " + padRight("[일시정지]", 12) + "P / ESC",
 		fmt.Sprintf("[배율]   설정에서 <-/->  (현재 x%d, %d~%d) - 실행 시 -zoom 으로도 지정",
@@ -1088,7 +1346,7 @@ func (g *Game) drawHelp(s *Screen) {
 		"강한 무기일수록 탄약이 적게 나옵니다. 탄이 떨어지면 1번 권총으로",
 		"자동 전환되고, 권총도 비면 근접 공격으로 넘어갑니다.",
 		"적:  g 돌격  w 군집  s 사격  b 자폭  m 치유사",
-		"     T 포탑  B 중장갑  S 저격  O 보스",
+		"     T 포탑  B 중장갑  S 저격  O 보스  Q 보스  C 최종 보스",
 		"",
 		"큰 공격 전에는 반드시 예고가 있습니다. 붉은 점선(:)이 그려지면 그 선에서",
 		"벗어나세요. 돌진을 피하면 벽에 부딪혀 잠시 무방비(x)가 됩니다. 자폭병(b)의",
@@ -1103,8 +1361,9 @@ func (g *Game) drawHelp(s *Screen) {
 	}
 
 	dungeon := []string{
-		"방:  보물방은 정예가 지키고, 매복방은 들어가면 문(X)이 닫힙니다.",
-		"     제단($)은 이득과 대가를 함께 주는 영구 교환입니다.",
+		"방:  보물방은 정예가 지키며 지도에 t, 발견한 매복방은 !로 남습니다.",
+		"     매복방 문은 X, 제단은 지도와 바닥 모두 $로 표시됩니다.",
+		"     오래 헤매면 목표 방향 -> 미니맵 구역 -> 정확한 위치 순으로 힌트가 열립니다.",
 		"",
 		"지형:  " + padRight("0 폭발통", 14) + "쏘면 연쇄 폭발. 적을 유인해서 터뜨리세요",
 		"       " + padRight("% 균열 벽", 14) + "폭발로만 부술 수 있습니다. 지름길이 열립니다",
@@ -1112,10 +1371,9 @@ func (g *Game) drawHelp(s *Screen) {
 		"",
 		"오래 머물수록 층 보너스가 줄고 증원이 도착합니다. 상단 [층 x..] 게이지가",
 		"차오르면 슬슬 내려갈 때입니다.",
-		"",
 		"적을 처치하면 경험치가 쌓이고, 레벨업 때 특성 3개 중 하나를 고릅니다.",
-		"5층마다 보스가 나오고, 보스를 처치해야 계단이 열립니다. 보스는 두 종류가",
-		"번갈아 나옵니다 - 오버시어(O)는 탄막과 소환, 매트리아크(Q)는 브루드와 돌진.",
+		"막 보스를 처치하면 결정타를 준 무기에 행동을 바꾸는 코어를 장착합니다.",
+		"B5 오버시어(O), B10 매트리아크(Q), B15 코어 워든(C)을 쓰러뜨리면 귀환합니다.",
 		"깊은 층의 치유사(m)는 아군 체력을 되돌리니 화력을 아끼지 말 것.",
 		"죽으면 처음부터 - 퍼머데스입니다.",
 		"[A/D 또는 <-/->] 페이지    그 외 키: 돌아가기",
@@ -1132,6 +1390,62 @@ func settingStatus(on bool) string {
 	return "꺼짐"
 }
 
+func appendPerfFloat(dst []byte, value float64, decimals int) []byte {
+	return strconv.AppendFloat(dst, value, 'f', decimals, 64)
+}
+
+func (g *Game) drawDebugPerf(s *Screen) {
+	p := &g.perf
+	line := p.lines[0][:0]
+	line = append(line, "FPS "...)
+	line = appendPerfFloat(line, p.fps, 1)
+	line = append(line, "  FRAME "...)
+	line = appendPerfFloat(line, p.frameMS, 2)
+	line = append(line, "ms  MAX "...)
+	line = appendPerfFloat(line, p.peakMS, 2)
+	line = append(line, "ms"...)
+	lines := [4][]byte{line}
+
+	line = p.lines[1][:0]
+	line = append(line, "UPD "...)
+	line = appendPerfFloat(line, p.updateMS, 3)
+	line = append(line, "ms  DRAW "...)
+	line = appendPerfFloat(line, p.drawMS, 3)
+	line = append(line, "ms  OUT "...)
+	line = appendPerfFloat(line, p.outputMS, 3)
+	line = append(line, "ms"...)
+	lines[1] = line
+
+	line = p.lines[2][:0]
+	line = append(line, "HEAP "...)
+	line = appendPerfFloat(line, float64(p.heapBytes)/(1<<20), 2)
+	line = append(line, "MB  GC "...)
+	line = appendUint(line, int(p.numGC))
+	line = append(line, "  GOR "...)
+	line = appendUint(line, p.goroutine)
+	lines[2] = line
+
+	line = p.lines[3][:0]
+	line = append(line, "OBJ E"...)
+	line = appendUint(line, len(g.enemies))
+	line = append(line, " B"...)
+	line = appendUint(line, len(g.bullets))
+	line = append(line, " L"...)
+	line = appendUint(line, len(g.pickups))
+	line = append(line, " FX"...)
+	line = appendUint(line, len(g.parts)+len(g.floaters)+len(g.decals))
+	lines[3] = line
+
+	maxW := max(1, s.W-2)
+	for i, text := range lines {
+		if len(text) > maxW { // diagnostics are deliberately ASCII-only
+			text = text[:maxW]
+		}
+		s.Fill(1, hudTop+1+i, len(text)+1, 1, ' ', colHUDText, 233)
+		s.StrBytes(2, hudTop+1+i, text, 51, 233)
+	}
+}
+
 func (g *Game) drawSettings(s *Screen) {
 	row := func(i int, text string) string {
 		if i == g.settingRow {
@@ -1145,6 +1459,7 @@ func (g *Game) drawSettings(s *Screen) {
 		row(2, fmt.Sprintf("자동 무기 변경: 탄약 소진 시 1번     %s", settingStatus(g.autoWeapon))),
 		row(3, fmt.Sprintf("화면 흔들림                         %s", settingStatus(g.screenShake))),
 		row(4, fmt.Sprintf("화면 배율                         x%d", g.zoom)),
+		row(5, fmt.Sprintf("성능 디버깅 정보                   %s", settingStatus(g.debugPerf))),
 		"",
 		"^/v 항목 선택 / <-/-> 조정 / O 또는 ESC로 돌아가기",
 	}
@@ -1164,6 +1479,23 @@ func (g *Game) drawGameOver(s *Screen) {
 	}
 	lines = append(lines, "", "[R] 새로 시작    [Q] 종료")
 	g.drawCenterBox(s, "G A M E   O V E R", lines, 196)
+}
+
+func (g *Game) drawVictory(s *Screen) {
+	lines := []string{
+		"심층 코어를 돌파하고 지상으로 귀환했습니다.",
+		"",
+		fmt.Sprintf("최종 층      B%d층", g.depth),
+		fmt.Sprintf("처치         %d", g.kills),
+		fmt.Sprintf("점수         %d", g.score),
+		fmt.Sprintf("돌파 시간    %s", fmtTime(g.elapsed)),
+		fmt.Sprintf("레벨         %d", g.player.level),
+	}
+	if g.showSeed {
+		lines = append(lines, fmt.Sprintf("시드         %d", g.seed))
+	}
+	lines = append(lines, "", "[R] 새 원정    [Q] 종료")
+	g.drawCenterBox(s, "D E E P   C O R E   C L E A R", lines, 226)
 }
 
 func init() {

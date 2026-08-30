@@ -62,13 +62,14 @@ const (
 )
 
 type Level struct {
-	W, H     int
-	Depth    int
-	tiles    []Tile
-	visible  []bool
-	explored []bool
-	rooms    []Rect
-	roomKind []RoomKind
+	W, H      int
+	Depth     int
+	tiles     []Tile
+	visible   []bool
+	explored  []bool
+	rooms     []Rect
+	roomKind  []RoomKind
+	roomLinks [][2]int // generated topology, retained for map validation
 
 	// flow is a Dijkstra distance map towards the player, rebuilt a few times
 	// per second and used by enemies to path around corners.
@@ -113,8 +114,8 @@ func (l *Level) Explored(x, y int) bool {
 // ---- generation -------------------------------------------------------------
 
 // GenerateLevel builds a BSP dungeon: the map is recursively split, one room is
-// carved per leaf, and sibling rooms are joined with L-shaped corridors. Deeper
-// floors get larger and more subdivided.
+// carved per leaf, and nearby rooms are joined into a connected graph with
+// several loops. Deeper acts also change the room silhouette and cover.
 func GenerateLevel(depth int, rng *rand.Rand) *Level {
 	w := clamp(64+depth*4, 64, 110)
 	h := clamp(38+depth*2, 38, 60)
@@ -160,23 +161,8 @@ func GenerateLevel(depth int, rng *rand.Rand) *Level {
 			Y: leaf.Y + rng.Intn(leaf.H-rh+1),
 			W: rw, H: rh,
 		}
-		l.carveRoom(room)
+		l.carveRoom(room, actForDepth(depth))
 		l.rooms = append(l.rooms, room)
-	}
-
-	// Connect every room to the previous one, plus a couple of extra loops so
-	// the floor is not a pure tree (loops make combat retreats possible).
-	for i := 1; i < len(l.rooms); i++ {
-		ax, ay := l.rooms[i-1].center()
-		bx, by := l.rooms[i].center()
-		l.carveCorridor(ax, ay, bx, by, rng)
-	}
-	for i := 0; i < 2+depth/3 && len(l.rooms) > 2; i++ {
-		a := l.rooms[rng.Intn(len(l.rooms))]
-		b := l.rooms[rng.Intn(len(l.rooms))]
-		ax, ay := a.center()
-		bx, by := b.center()
-		l.carveCorridor(ax, ay, bx, by, rng)
 	}
 
 	// Rotate the room list so the entrance lands in a random room. The BSP
@@ -189,6 +175,21 @@ func GenerateLevel(depth int, rng *rand.Rand) *Level {
 		rooms = append(rooms, l.rooms[:rot]...)
 		l.rooms = rooms
 	}
+
+	// Connect close neighbours first. The old leaf-order chain could join two
+	// far corners simply because their BSP leaves happened to be adjacent in
+	// the slice, drawing long corridors across half the dungeon. A local
+	// spanning tree keeps travel legible; extra links make retreat routes and
+	// launcher shortcuts useful without sacrificing connectivity.
+	extraLoops := clamp(2+depth/4, 2, 5)
+	l.roomLinks = planRoomLinks(l.rooms, extraLoops, rng)
+	for _, link := range l.roomLinks {
+		a, b := l.rooms[link[0]], l.rooms[link[1]]
+		ax, ay := a.center()
+		bx, by := b.center()
+		l.carveCorridor(ax, ay, bx, by, rng)
+	}
+	l.decorateRooms(actForDepth(depth), rng)
 
 	l.roomKind = make([]RoomKind, len(l.rooms))
 
@@ -304,11 +305,151 @@ func splitRect(r Rect, min int, rng *rand.Rand) (Rect, Rect, bool) {
 	return Rect{r.X, r.Y, cut, r.H}, Rect{r.X + cut, r.Y, r.W - cut, r.H}, true
 }
 
-func (l *Level) carveRoom(r Rect) {
+// planRoomLinks builds a connected local graph, then adds short non-tree
+// edges. Keeping this separate from carving makes the topology testable without
+// inferring it from corridor pixels after rooms overlap them.
+func planRoomLinks(rooms []Rect, extra int, rng *rand.Rand) [][2]int {
+	n := len(rooms)
+	if n < 2 {
+		return nil
+	}
+	linked := make([]bool, n*n)
+	connected := make([]bool, n)
+	connected[rng.Intn(n)] = true
+	links := make([][2]int, 0, n-1+extra)
+
+	dist2 := func(a, b int) int {
+		ax, ay := rooms[a].center()
+		bx, by := rooms[b].center()
+		dx, dy := ax-bx, ay-by
+		return dx*dx + dy*dy
+	}
+	add := func(a, b int) {
+		if a > b {
+			a, b = b, a
+		}
+		linked[a*n+b], linked[b*n+a] = true, true
+		links = append(links, [2]int{a, b})
+	}
+
+	for count := 1; count < n; count++ {
+		best := int(^uint(0) >> 1)
+		for a := 0; a < n; a++ {
+			if !connected[a] {
+				continue
+			}
+			for b := 0; b < n; b++ {
+				if !connected[b] && dist2(a, b) < best {
+					best = dist2(a, b)
+				}
+			}
+		}
+		// Pick among nearly equal local connections so the same room geometry
+		// still produces more than one sensible route graph across seeds.
+		limit := best + best/3 + 16
+		var choices [][2]int
+		for a := 0; a < n; a++ {
+			if !connected[a] {
+				continue
+			}
+			for b := 0; b < n; b++ {
+				if !connected[b] && dist2(a, b) <= limit {
+					choices = append(choices, [2]int{a, b})
+				}
+			}
+		}
+		pick := choices[rng.Intn(len(choices))]
+		add(pick[0], pick[1])
+		connected[pick[1]] = true
+	}
+
+	for loop := 0; loop < extra; loop++ {
+		best := int(^uint(0) >> 1)
+		for a := 0; a < n; a++ {
+			for b := a + 1; b < n; b++ {
+				if !linked[a*n+b] && dist2(a, b) < best {
+					best = dist2(a, b)
+				}
+			}
+		}
+		if best == int(^uint(0)>>1) {
+			break
+		}
+		limit := best + best/2 + 25
+		var choices [][2]int
+		for a := 0; a < n; a++ {
+			for b := a + 1; b < n; b++ {
+				if !linked[a*n+b] && dist2(a, b) <= limit {
+					choices = append(choices, [2]int{a, b})
+				}
+			}
+		}
+		pick := choices[rng.Intn(len(choices))]
+		add(pick[0], pick[1])
+	}
+	return links
+}
+
+func (l *Level) carveRoom(r Rect, act int) {
+	cx, cy := r.center()
 	for y := r.Y; y < r.Y+r.H; y++ {
 		for x := r.X; x < r.X+r.W; x++ {
-			if l.inBounds(x, y) {
+			carve := true
+			if act == 1 {
+				// Biolab rooms are rounded capsules, with a cross through the
+				// middle guaranteeing a broad path to every corridor entrance.
+				rx, ry := float64(r.W)/2, float64(r.H)/2
+				dx := (float64(x) + 0.5 - (float64(r.X) + rx)) / rx
+				dy := (float64(y) + 0.5 - (float64(r.Y) + ry)) / ry
+				carve = dx*dx+dy*dy <= 1.0 || absInt(x-cx) <= 1 || absInt(y-cy) <= 1
+			}
+			if carve && l.inBounds(x, y) {
 				l.tiles[l.idx(x, y)] = TileFloor
+			}
+		}
+	}
+}
+
+// decorateRooms adds sparse reactor cover after corridors are carved, so a
+// pillar can shape a firefight but can never erase the only doorway.
+func (l *Level) decorateRooms(act int, rng *rand.Rand) {
+	if act != 2 {
+		return
+	}
+	for _, r := range l.rooms {
+		if r.W < 9 || r.H < 7 || rng.Float64() < 0.25 {
+			continue
+		}
+		cx, cy := r.center()
+		spots := [][2]int{
+			{r.X + r.W/3, r.Y + r.H/3},
+			{r.X + r.W*2/3, r.Y + r.H/3},
+			{r.X + r.W/3, r.Y + r.H*2/3},
+			{r.X + r.W*2/3, r.Y + r.H*2/3},
+		}
+		placed := 0
+		for _, p := range spots {
+			x, y := p[0], p[1]
+			if absInt(x-cx) <= 1 && absInt(y-cy) <= 1 || !l.inBounds(x, y) {
+				continue
+			}
+			// A full floor ring means this is cover in open space, not a plug
+			// placed into a corridor or a narrow doorway.
+			clear := true
+			for dy := -1; dy <= 1 && clear; dy++ {
+				for dx := -1; dx <= 1; dx++ {
+					if l.Solid(x+dx, y+dy) {
+						clear = false
+						break
+					}
+				}
+			}
+			if clear {
+				l.tiles[l.idx(x, y)] = TileWall
+				placed++
+			}
+			if placed == 2 {
+				break
 			}
 		}
 	}

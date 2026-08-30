@@ -55,27 +55,43 @@ func readTTYEvents(in *os.File, leftover []byte, ch chan<- Event) {
 	// Anything typed during the capability handshake is replayed first.
 	buf := append(make([]byte, 0, 1024), leftover...)
 	tmp := make([]byte, 512)
+	timedReads := isTTY(in)
 	for {
-		n, err := in.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			for {
-				ev, used, ok := parseEvent(buf)
-				if !ok {
-					break
-				}
-				buf = buf[used:]
-				if ev.Kind != EvKey || ev.Key != KeyNone || ev.Rune != 0 {
-					ch <- ev
-				}
+		for {
+			ev, used, ok := parseEvent(buf)
+			if !ok {
+				break
 			}
-			// Drop a lone dangling ESC-prefixed fragment that never completed;
-			// otherwise a partial sequence would wedge parsing.
-			if len(buf) > 64 {
-				buf = buf[:0]
+			buf = buf[used:]
+			if ev.Kind != EvKey || ev.Key != KeyNone || ev.Rune != 0 {
+				ch <- ev
 			}
 		}
-		if err != nil {
+		// Drop a dangling ESC-prefixed fragment that grew beyond any supported
+		// sequence; otherwise malformed input would wedge parsing indefinitely.
+		if len(buf) > 64 {
+			buf = buf[:0]
+		}
+
+		n, err := syscall.Read(int(in.Fd()), tmp)
+		if err == syscall.EINTR {
+			continue
+		}
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			continue
+		}
+		if n == 0 && timedReads && err == nil {
+			// ESC is both a complete key and the prefix of every legacy control
+			// sequence. The terminal's 100 ms idle read is the only reliable way
+			// to distinguish a lone press without delaying normal sequences.
+			if len(buf) == 1 && buf[0] == 0x1b {
+				ch <- Event{Kind: EvKey, Key: KeyEscape, KeyAct: KeyPress, Src: SrcTTY}
+				buf = buf[:0]
+			}
+			continue
+		}
+		if err != nil || n == 0 {
 			ch <- Event{Kind: EvStop}
 			return
 		}

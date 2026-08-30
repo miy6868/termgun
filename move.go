@@ -1,5 +1,7 @@
 package main
 
+import "math"
+
 // Direction slots. Movement is tracked per key rather than as a single vector
 // so that holding two directions produces a real diagonal.
 const (
@@ -19,6 +21,14 @@ const (
 	// promptly after the last one, so stopping stays crisp.
 	legacyRepeatFactor = 3.0
 	legacyMinHold      = 0.10
+
+	// Keyboard movement should feel like direct intent, not a heavy body being
+	// pushed across the floor. Separate response rates keep starts immediate,
+	// stops precise, and reversals decisive without making velocity frame-rate
+	// dependent.
+	moveStartResponse = 36.0
+	moveStopResponse  = 160.0
+	moveTurnResponse  = 60.0
 )
 
 // movement resolves the keyboard into a direction vector.
@@ -132,4 +142,21 @@ func dirFor(r rune, k Key) int {
 		return dirRight
 	}
 	return -1
+}
+
+// steerMovementVelocity grades each axis separately. Releasing W while still
+// holding D must brake the vertical component immediately; grading the vector
+// as a whole would mistake that diagonal-to-horizontal change for acceleration.
+func steerMovementVelocity(current, target Vec, dt float64) Vec {
+	axis := func(now, want float64) float64 {
+		response := moveStartResponse
+		if math.Abs(want) < 1e-9 {
+			response = moveStopResponse
+		} else if now*want < 0 {
+			response = moveTurnResponse
+		}
+		blend := 1 - math.Exp(-response*dt)
+		return now + (want-now)*blend
+	}
+	return Vec{X: axis(current.X, target.X), Y: axis(current.Y, target.Y)}
 }

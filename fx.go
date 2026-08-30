@@ -17,20 +17,36 @@ const (
 	bossSlowmo      = 0.16 // a boss death earns a longer beat
 	killSlowmoScale = 0.25 // simulation speed while slow motion lasts
 
-	dashBufferTime = 0.18 // a queued dash this old still fires when ready
-	// How fast held movement keys may bend a live dash, in radians per second.
-	// Rate-limited on purpose: the dash must stay a committed blink you aim
-	// before pressing, not a second movement mode.
-	dashSteerRate  = 3.2
-	fireBufferTime = 0.15 // same for a trigger tap landed during cooldown
+	dashBufferTime       = 0.25 // covers one base dash plus its vulnerable recovery
+	fireBufferTime       = 0.15 // same for a trigger tap landed during cooldown
+	quickMeleeBufferTime = 0.20 // lets the emergency swing follow a nearly-ready shot
 
-	// Perfect dodge: a hit that lands while the dash is still young is not
-	// just absorbed, it pays out. The window has to cover the whole blink plus
-	// a beat of the invulnerability that follows, or the reward would demand
-	// frame-perfect timing instead of brave timing.
+	// Dash energy: one press is a short committed step. Repeated presses spend
+	// the shared pool, making distance an explicit player choice.
+	dashEnergyBase      = 100.0
+	dashEnergyCost      = 30.0
+	dashRegenBase       = 18.0
+	dashRegenDelay      = 0.35
+	dashDuration        = 0.10
+	dashDistance        = 3.5
+	dashDistanceStep    = 0.25
+	dashRecovery        = 0.08
+	dashCoastDuration   = 0.14
+	dashCoastStartMul   = 1.50
+	dashChainWindow     = 0.60
+	dashRepeatHitCD     = 0.30
+	dashMomentumStep    = 0.25
+	dashMomentumFullGap = 0.14
+	dashMomentumFadeGap = 0.40
+	dashStraightBonus2  = 0.35
+	dashStraightBonus3  = 0.50
+
+	// Perfect dodge: a hit absorbed during a young dash pays out. The window is
+	// deliberately wider than the short step, but the invulnerability itself
+	// ends with the step, leaving recovery vulnerable.
 	perfectDodgeWindow = 0.30 // seconds after the dash starts
 	perfectDodgeSlowmo = 0.32 // seconds of bullet time granted
-	perfectDodgeRefund = 0.50 // share of the dash gauge handed back
+	perfectDodgeEnergy = 20.0 // energy returned once per dash chain
 
 	stairsShimmerChance = 0.10 // per-frame chance of a mote rising off the stairs
 
@@ -128,12 +144,12 @@ func (g *Game) stairsShimmer() {
 	if !g.level.Visible(int(g.stairsPos.X), int(g.stairsPos.Y)) {
 		return
 	}
-	if g.rng.Float64() >= stairsShimmerChance {
+	if g.fxRNG.Float64() >= stairsShimmerChance {
 		return
 	}
 	g.parts = append(g.parts, Particle{
-		pos:  g.stairsPos.Add(Vec{g.rng.Float64()*0.8 - 0.4, g.rng.Float64()*0.4 - 0.2}),
-		vel:  Vec{(g.rng.Float64() - 0.5) * 0.6, -1.2},
+		pos:  g.stairsPos.Add(Vec{g.fxRNG.Float64()*0.8 - 0.4, g.fxRNG.Float64()*0.4 - 0.2}),
+		vel:  Vec{(g.fxRNG.Float64() - 0.5) * 0.6, -1.2},
 		life: 0.55, max: 0.55,
 		glyph: '.', color: colStairs,
 	})

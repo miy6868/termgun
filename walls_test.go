@@ -116,7 +116,7 @@ func TestNobodyEndsUpInsideAWall(t *testing.T) {
 		g.mouseSet = true
 		for frame := 0; frame < 60*400 && g.depth < 8; frame++ {
 			switch g.state {
-			case StateLevelUp:
+			case StateLevelUp, StateWeaponCore:
 				g.handleKey(Event{Kind: EvKey, Rune: '1'})
 				continue
 			case StateDead:

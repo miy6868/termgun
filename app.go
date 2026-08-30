@@ -95,8 +95,24 @@ func runGame(cfg appConfig, in, output *os.File) error {
 			dt = 0.1
 		}
 
-		game.Update(dt)
+		if game.debugPerf {
+			started := time.Now()
+			game.Update(dt)
+			updated := time.Now()
+			if screen.W < minCols || screen.H < minRows {
+				drawTooSmall(screen)
+			} else {
+				game.Draw(screen)
+			}
+			drawn := time.Now()
+			screen.Flush()
+			presented := time.Now()
+			game.recordPerformance(updated.Sub(started), drawn.Sub(updated),
+				presented.Sub(drawn), presented)
+			continue
+		}
 
+		game.Update(dt)
 		if screen.W < minCols || screen.H < minRows {
 			drawTooSmall(screen)
 		} else {

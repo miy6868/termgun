@@ -212,10 +212,9 @@ func TestLevelConnectivity(t *testing.T) {
 	}
 }
 
-// TestDashSteersTowardHeldKeys pins mid-dash steering: holding a direction
-// bends a live dash towards it, but only at the rate limit — the dash stays a
-// committed blink rather than becoming free flight.
-func TestDashSteersTowardHeldKeys(t *testing.T) {
+// TestChainedDashReaimsBetweenSteps pins the new contract: a live short dash
+// is committed, while the next press reads the player's latest direction.
+func TestChainedDashReaimsBetweenSteps(t *testing.T) {
 	g := newGameWithInput(3, InputKitty)
 	g.pressMove('w', KeyNone)
 	g.startDash()
@@ -225,18 +224,17 @@ func TestDashSteersTowardHeldKeys(t *testing.T) {
 
 	g.move.release(dirUp)
 	g.pressMove('d', KeyNone)
-	start := math.Atan2(g.player.dashDir.Y, g.player.dashDir.X)
-	for i := 0; i < 6; i++ { // 0.1s of dash, still inside the 0.16s window
-		g.Update(1.0 / 60)
-	}
+	g.Update(dashDuration / 2)
 	if g.player.dashTimer <= 0 {
-		t.Fatal("the dash ended before steering could be observed")
+		t.Fatal("the short dash ended too early")
 	}
-	end := math.Atan2(g.player.dashDir.Y, g.player.dashDir.X)
-	da := end - start
-	if da <= 0 || da > dashSteerRate*0.1+1e-9 {
-		t.Fatalf("holding right for 0.1s turned an up-dash by %.3f rad; want (0, %.3f]",
-			da, dashSteerRate*0.1)
+	if g.player.dashDir.Y >= -0.9 || math.Abs(g.player.dashDir.X) > 0.1 {
+		t.Fatalf("a live dash steered after launch: %v", g.player.dashDir)
+	}
+	g.Update(dashDuration/2 + dashRecovery + 0.01)
+	g.startDash()
+	if g.player.dashDir.X <= 0.9 || math.Abs(g.player.dashDir.Y) > 0.1 {
+		t.Fatalf("the next dash did not re-aim right: %v", g.player.dashDir)
 	}
 }
 
